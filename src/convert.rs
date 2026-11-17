@@ -616,6 +616,90 @@ impl P {
                     }
                 }
             }
+            "EVALUATE" => {
+                self.next();
+                let r: Result<Stmt, String> = (|| {
+                    let is_true = self.word() == "TRUE";
+                    let subj = if is_true {
+                        self.next();
+                        None
+                    } else {
+                        Some(self.expr(1)?)
+                    };
+                    let mut arms: Vec<(Option<Cond>, Vec<Stmt>)> = vec![];
+                    while self.word() == "WHEN" {
+                        let mut conds: Vec<Cond> = vec![];
+                        let mut other = false;
+                        while self.word() == "WHEN" {
+                            self.next();
+                            if self.word() == "OTHER" {
+                                self.next();
+                                other = true;
+                                continue;
+                            }
+                            let c = if let Some(s) = &subj {
+                                let a = self.expr(1)?;
+                                if self.word() == "THRU" || self.word() == "THROUGH" {
+                                    self.next();
+                                    let b = self.expr(1)?;
+                                    Cond::And(
+                                        Box::new(Cond::Cmp(">=".into(), s.clone(), a)),
+                                        Box::new(Cond::Cmp("<=".into(), s.clone(), b)),
+                                    )
+                                } else {
+                                    Cond::Cmp("==".into(), s.clone(), a)
+                                }
+                            } else {
+                                self.cond()?
+                            };
+                            if self.word() == "ALSO" {
+                                return Err("ALSO(複数主語)は未対応".into());
+                            }
+                            conds.push(c);
+                        }
+                        let body = self.block(true, &["WHEN", "END-EVALUATE"]);
+                        let c = if other {
+                            None
+                        } else {
+                            let mut it = conds.into_iter();
+                            let mut c = it.next().ok_or("WHEN の条件が無い")?;
+                            for n in it {
+                                c = Cond::Or(Box::new(c), Box::new(n));
+                            }
+                            Some(c)
+                        };
+                        arms.push((c, body));
+                    }
+                    if self.word() == "END-EVALUATE" {
+                        let d = self.peek().map(|t| t.dot).unwrap_or(false);
+                        self.next();
+                        self.ended = d;
+                    }
+                    let mut tail: Vec<Stmt> = vec![];
+                    for (c, body) in arms.into_iter().rev() {
+                        tail = match c {
+                            None => body,
+                            Some(c) => vec![Stmt::If(c, body, tail)],
+                        };
+                    }
+                    Ok(if tail.len() == 1 {
+                        tail.remove(0)
+                    } else {
+                        Stmt::If(Cond::Cmp("==".into(), Expr::Num("1".into()), Expr::Num("1".into())), tail, vec![])
+                    })
+                })();
+                r.unwrap_or_else(|e| {
+                    while let Some(t) = self.peek() {
+                        let end = t.s.to_uppercase() == "END-EVALUATE";
+                        let d = t.dot;
+                        self.next();
+                        if end || d {
+                            break;
+                        }
+                    }
+                    Stmt::Todo(format!("EVALUATE: {e}"))
+                })
+            }
             "PERFORM" => {
                 self.next();
                 let w = self.word();
@@ -719,12 +803,59 @@ impl P {
                 }
             }
             "EVALUATE" => {
-                while let Some(x) = self.next() {
-                    if x.s.to_uppercase() == "END-EVALUATE" {
-                        break;
+                self.next();
+                let is_true = self.word() == "TRUE";
+                let subj = if is_true { self.next(); None } else { self.expr(1).ok() };
+                if !is_true && subj.is_none() {
+                    while let Some(x) = self.next() {
+                        if x.s.to_uppercase() == "END-EVALUATE" {
+                            break;
+                        }
+                    }
+                    return Some(Stmt::Todo("EVALUATE: 対象を解釈できない".into()));
+                }
+                let mut arms: Vec<(Option<Cond>, Vec<Stmt>)> = vec![];
+                let mut bad = false;
+                while self.word() == "WHEN" {
+                    self.next();
+                    let c: Option<Cond> = if self.word() == "OTHER" {
+                        self.next();
+                        None
+                    } else if is_true {
+                        match self.cond() { Ok(c) => Some(c), Err(_) => { bad = true; None } }
+                    } else {
+                        let mut alts: Option<Cond> = None;
+                        loop {
+                            match self.expr(1) {
+                                Ok(v) => {
+                                    let one = Cond::Cmp("==".into(), subj.clone().unwrap(), v);
+                                    alts = Some(match alts { None => one, Some(a) => Cond::Or(Box::new(a), Box::new(one)) });
+                                }
+                                Err(_) => { bad = true; break; }
+                            }
+                            if self.word() == "WHEN" { self.next(); } else { break; }
+                        }
+                        alts
+                    };
+                    let body = self.block(false, &["WHEN", "END-EVALUATE"]);
+                    arms.push((c, body));
+                }
+                if self.word() == "END-EVALUATE" {
+                    let d = self.peek().map(|t| t.dot).unwrap_or(false);
+                    self.next();
+                    self.ended = d;
+                }
+                if bad {
+                    return Some(Stmt::Todo("EVALUATE: WHEN の形が未対応".into()));
+                }
+                let mut tail: Vec<Stmt> = vec![];
+                for (c, body) in arms.into_iter().rev() {
+                    match c {
+                        None => tail = body,
+                        Some(c) => tail = vec![Stmt::If(c, body, tail)],
                     }
                 }
-                Stmt::Todo("EVALUATE".into())
+                if tail.len() > 1 { Stmt::If(Cond::Cmp("==".into(), Expr::Num("1".into()), Expr::Num("1".into())), tail, vec![]) } else { tail.into_iter().next().unwrap_or(Stmt::Nop) }
             }
             "ELSE" | "END-IF" | "END-PERFORM" | "WHEN" | "END-EVALUATE" => {
                 // 対応する開始が無い終端語: 読み飛ばす
@@ -1083,6 +1214,23 @@ mod tests {
         let rs = to_rust(&p);
         assert!(rs.contains("while !(self.i > 5) {"), "{rs}");
         assert!(rs.contains("fn p_show(&mut self) -> bool"), "{rs}");
+    }
+    #[test]
+    fn evaluate_arms() {
+        let src = "       PROGRAM-ID. E.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 N PIC 9 VALUE 2.
+       PROCEDURE DIVISION.
+           EVALUATE N
+               WHEN 1 DISPLAY \"ONE\"
+               WHEN 2 WHEN 3 DISPLAY \"TWO-THREE\"
+               WHEN OTHER DISPLAY \"X\"
+           END-EVALUATE.
+           STOP RUN.
+";
+        let py = to_python(&parse(src, false));
+        assert!(py.contains("if self.n == 1:") && py.contains("elif") == false && py.contains("self.n == 3"), "{py}");
     }
     #[test]
     fn unsupported_stays_visible() {
