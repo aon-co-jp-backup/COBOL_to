@@ -22,7 +22,7 @@ Version: ${ver}
 Section: devel
 Priority: optional
 Architecture: ${arch}
-Depends: libc6
+Depends: libc6, libwayland-client0
 Recommends: xdg-desktop-portal
 Maintainer: aon-co-jp <noreply@users.noreply.github.com>
 Homepage: https://github.com/aon-co-jp/COBOL_to
