@@ -66,7 +66,7 @@ jobs:
           cobol_to --src tests/samples --target rpoem --out "$RUNNER_TEMP/out" </dev/null
           test -f "$RUNNER_TEMP/out/src/programs/hello.rs"
           sudo dpkg -r cobol-to
-          ! command -v cobol_to
+          hash -r; test ! -e /usr/bin/cobol_to
       - uses: actions/upload-artifact@v4
         with: { name: "linux-${{ matrix.arch }}", path: "dist/*" }
 
@@ -75,7 +75,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { runner: macos-14, arch: arm64, target: aarch64-apple-darwin }
+          - { runner: macos-15, arch: arm64, target: aarch64-apple-darwin }
           - { runner: macos-15-intel, arch: x64, target: x86_64-apple-darwin }
     runs-on: ${{ matrix.runner }}
     steps:
