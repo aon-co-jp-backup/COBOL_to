@@ -1109,7 +1109,7 @@ pub fn to_python(p: &Program) -> String {
 }
 
 pub fn to_rust(p: &Program) -> String {
-    let mut o = String::from("// COBOL_to generated. 数値は i64、文字は String。\n#![allow(unused_parens, unused_assignments, unused_mut, unused_variables, dead_code)]\npub struct State {\n    out: String,\n");
+    let mut o = String::from("// COBOL_to generated. 数値は i64、文字は String。\n#![allow(unreachable_code, unused_parens, unused_assignments, unused_mut, unused_variables, dead_code)]\npub struct State {\n    out: String,\n");
     for v in &p.vars {
         o += &format!("    {}: {},\n", ident(&v.name), if v.numeric { "i64" } else { "String" });
     }
