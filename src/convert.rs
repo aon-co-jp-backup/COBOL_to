@@ -1,8 +1,10 @@
 //! COBOL(固定/自由形式)の部分集合 → 共通IR → Python / Rust。
-//! 対応: PROGRAM-ID / 01〜49・77(PIC, VALUE) / DISPLAY / MOVE / ADD / SUBTRACT / MULTIPLY / DIVIDE / COMPUTE /
-//!       IF-ELSE-END-IF(AND・OR・NOT・比較) / PERFORM(段落・n TIMES・UNTIL・VARYING・インライン) / 段落 / STOP RUN・GOBACK。
-//! 未対応の文(ファイル I/O・EVALUATE・GO TO・CALL 等)は TODO コメントとして出力し、黙って落とさない。
-//! 数値は整数(i64)として扱う(小数 PIC は整数に丸めた近似で、TODO を付ける)。
+//! 対応: PROGRAM-ID / 01〜49・77・88(PIC, VALUE, OCCURS, REDEFINES) / DISPLAY / ACCEPT / MOVE / ADD / SUBTRACT / MULTIPLY / DIVIDE(REMAINDER) / COMPUTE /
+//!       IF-ELSE-END-IF(AND・OR・NOT・比較・条件名・NUMERIC/ALPHABETIC) / EVALUATE / PERFORM(段落・THRU・n TIMES・UNTIL・VARYING・インライン) /
+//!       GO TO(DEPENDING ON 含む) / 段落 / STOP RUN・GOBACK / STRING・UNSTRING・INSPECT / INITIALIZE・SET / CALL(外部登録) /
+//!       COPY(変換前に展開) / 順編成ファイル(SELECT・FD・OPEN・READ・WRITE・CLOSE) / 組み込み関数(一部)。
+//! 数値は PIC の小数桁(V)を持つ固定小数点(i64 を 10^scale 倍した整数)。ROUNDED は四捨五入、省略は切り捨て。
+//! 未対応の文(SORT・EXEC SQL/CICS・索引/相対ファイル等)は TODO コメントとして出力し、黙って落とさない。
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -10,6 +12,8 @@ pub enum Expr {
     Num(String),
     Str(String),
     Var(String),
+    Idx(String, Box<Expr>),          // 添字つき(1 始まり)
+    Func(String, Vec<Expr>),         // FUNCTION NAME(args)
     Bin(char, Box<Expr>, Box<Expr>), // + - * / ^
     Neg(Box<Expr>),
 }
@@ -20,6 +24,7 @@ pub enum Cond {
     And(Box<Cond>, Box<Cond>),
     Or(Box<Cond>, Box<Cond>),
     Not(Box<Cond>),
+    Class(Expr, String), // NUMERIC / ALPHABETIC
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -31,8 +36,17 @@ pub enum Loop {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub enum Inspect {
+    Tally(String, Expr),
+    Replace { first: bool, from: Expr, to: Expr },
+    Convert(Expr, Expr),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
     Display(Vec<Expr>),
+    DisplayNoNl(Vec<Expr>),
+    Accept(String),
     Move(Expr, Vec<String>),
     Assign(String, Expr),      // x = e
     AddTo(String, Expr),       // x += e
@@ -41,18 +55,49 @@ pub enum Stmt {
     If(Cond, Vec<Stmt>, Vec<Stmt>),
     Perform(Loop, Vec<Stmt>),
     Call(String),              // PERFORM 段落
+    Thru(String, String),      // PERFORM a THRU b
+    Goto(String),
+    Initialize(Vec<String>),
+    Str(Vec<(Expr, Option<Expr>)>, String),   // STRING ... INTO
+    Unstring(Expr, Expr, bool, Vec<String>),  // UNSTRING src DELIMITED BY [ALL] d INTO ...
+    Inspect(String, Inspect),
+    CallExt(String, Vec<Expr>),               // CALL "X" USING ...
+    Open(String, String),                     // ファイル, input/output/extend/io
+    Close(String),
+    Read(String, Option<String>, Vec<Stmt>, Vec<Stmt>), // ファイル, INTO, AT END, NOT AT END
+    Write(String, Option<Expr>),              // レコード名, FROM
     Stop,
     Nop,
     Todo(String),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Var {
     pub name: String,
     pub numeric: bool,
     pub init: String,
     pub decimal: bool,
     pub undeclared: bool,
+    pub scale: u32,
+    pub width: usize,
+    pub occurs: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FileDef {
+    pub name: String,
+    pub assign: String,
+    pub assign_lit: bool,
+    pub status: Option<String>,
+    pub record: String,
+    pub fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CondName {
+    pub name: String,
+    pub parent: String,
+    pub values: Vec<(Expr, Option<Expr>)>,
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -61,27 +106,49 @@ pub struct Program {
     pub vars: Vec<Var>,
     pub stmts: Vec<Stmt>,
     pub paragraphs: Vec<(String, Vec<Stmt>)>,
+    pub subs: Vec<Expr>,
+    pub alias: Vec<(String, String)>,
+    pub files: Vec<FileDef>,
+    pub conds: Vec<CondName>,
+    pub notes: Vec<String>,
 }
 
 fn strip(src: &str, free: bool) -> Vec<String> {
-    src.lines()
-        .filter_map(|l| {
-            let l: String = if free {
-                l.to_string()
-            } else {
-                let c: Vec<char> = l.chars().collect();
-                if c.len() <= 6 || c[6] == '*' || c[6] == '/' {
-                    return None;
-                }
-                c[6..c.len().min(72)].iter().collect()
-            };
-            if l.trim_start().starts_with("*>") || l.trim().is_empty() {
-                None
-            } else {
-                Some(l)
+    let mut out: Vec<String> = vec![];
+    for l in src.lines() {
+        let l: String = if free {
+            l.to_string()
+        } else {
+            let c: Vec<char> = l.chars().collect();
+            if c.len() <= 6 || c[6] == '*' || c[6] == '/' {
+                continue;
             }
-        })
-        .collect()
+            let body: String = c[7.min(c.len())..c.len().min(72)].iter().collect();
+            if c[6] == '-' {
+                // 継続行: 直前が閉じていない文字定数なら、先頭の引用符を落として空白ごと連結する
+                if let Some(prev) = out.last_mut() {
+                    let quotes = prev.chars().filter(|&x| x == '"' || x == '\'').count();
+                    let t = body.trim_start();
+                    if quotes % 2 == 1 && (t.starts_with('"') || t.starts_with('\'')) {
+                        while prev.chars().count() < 66 {
+                            prev.push(' ');
+                        }
+                        prev.push_str(&t[1..]);
+                    } else {
+                        prev.push(' ');
+                        prev.push_str(t);
+                    }
+                }
+                continue;
+            }
+            format!(" {body}")
+        };
+        if l.trim_start().starts_with("*>") || l.trim().is_empty() {
+            continue;
+        }
+        out.push(l);
+    }
+    out
 }
 
 fn ident(n: &str) -> String {
@@ -145,7 +212,8 @@ fn tokenize(s: &str) -> Vec<Tok> {
     v
 }
 
-const STARTERS: [&str; 34] = [
+const STARTERS: &[&str] = &[
+    "COPY", "START", "DELETE", "SEARCH", "RETURN", "RELEASE", "MERGE", "INVOKE", "CANCEL", "ALTER", "END-READ", "END-CALL", "END-STRING", "END-UNSTRING", "END-WRITE", "END-SEARCH", "END-ACCEPT", "END-DISPLAY", "END-COMPUTE", "END-ADD", "END-SUBTRACT", "END-MULTIPLY", "END-DIVIDE", "END-EXEC",
     "DISPLAY", "MOVE", "ADD", "SUBTRACT", "MULTIPLY", "DIVIDE", "COMPUTE", "IF", "ELSE", "END-IF", "PERFORM", "END-PERFORM", "STOP", "GOBACK", "EXIT", "CONTINUE", "OPEN", "CLOSE", "READ", "WRITE", "CALL", "EVALUATE", "END-EVALUATE", "WHEN", "ACCEPT", "GO", "INITIALIZE", "SET", "STRING", "UNSTRING", "INSPECT", "SORT", "EXEC", "REWRITE",
 ];
 
@@ -158,9 +226,46 @@ struct P {
     i: usize,
     ended: bool, // 直前に消費したトークンが文末(.)だった
     used: BTreeSet<String>,
+    subs: Vec<Expr>,
+    conds: Vec<CondName>,
+    files: Vec<FileDef>,
 }
 
 impl P {
+    /// 代入先の文字列表現: 名前[\0添字番号][\u{1}=ROUNDED]
+    fn lv_of(&mut self, e: Expr) -> Option<String> {
+        match e {
+            Expr::Var(n) => Some(n),
+            Expr::Idx(n, i) => {
+                let (base, r) = match n.strip_suffix('\u{1}') {
+                    Some(b) => (b.to_string(), true),
+                    None => (n, false),
+                };
+                self.subs.push(*i);
+                Some(format!("{base}\0{}{}", self.subs.len() - 1, if r { "\u{1}" } else { "" }))
+            }
+            _ => None,
+        }
+    }
+    fn cond_of_name(&self, n: &str) -> Option<Cond> {
+        let c = self.conds.iter().find(|c| c.name == n)?;
+        let mut acc: Option<Cond> = None;
+        for (a, b) in &c.values {
+            let v = Expr::Var(c.parent.clone());
+            let one = match b {
+                None => Cond::Cmp("==".into(), v, a.clone()),
+                Some(b) => Cond::And(Box::new(Cond::Cmp(">=".into(), v.clone(), a.clone())), Box::new(Cond::Cmp("<=".into(), v, b.clone()))),
+            };
+            acc = Some(match acc {
+                None => one,
+                Some(p) => Cond::Or(Box::new(p), Box::new(one)),
+            });
+        }
+        acc
+    }
+    fn file_named(&self, n: &str) -> Option<&FileDef> {
+        self.files.iter().find(|f| f.name == n)
+    }
     fn peek(&self) -> Option<&Tok> {
         self.t.get(self.i)
     }
@@ -197,6 +302,9 @@ impl P {
         if c == '"' || c == '\'' {
             return Ok(Expr::Str(s[1..s.len().saturating_sub(1)].to_string()));
         }
+        if s.contains(':') {
+            return Err("参照修飾(X(a:b))は未対応".into());
+        }
         if c.is_ascii_digit() || (c == '-' && s.len() > 1) {
             return Ok(Expr::Num(s));
         }
@@ -206,10 +314,33 @@ impl P {
             _ => {}
         }
         if s.to_uppercase() == "FUNCTION" {
-            return Err("FUNCTION は未対応".into());
+            let name = self.next().ok_or("FUNCTION 名が無い")?.s.to_uppercase();
+            const KNOWN: [&str; 9] = ["LENGTH", "UPPER-CASE", "LOWER-CASE", "REVERSE", "MAX", "MIN", "ABS", "MOD", "NUMVAL"];
+            let known = KNOWN.contains(&name.as_str()) || name == "INTEGER";
+            if !known {
+                return Err(format!("FUNCTION {name} は未対応"));
+            }
+            let mut args = vec![];
+            if self.peek().map(|x| x.s == "(").unwrap_or(false) {
+                self.next();
+                while self.peek().map(|x| x.s != ")").unwrap_or(false) {
+                    args.push(self.expr(1)?);
+                }
+                self.next();
+            }
+            return Ok(Expr::Func(name, args));
         }
         let n = ident(&s);
         self.used.insert(n.clone());
+        if self.peek().map(|x| x.s == "(").unwrap_or(false) {
+            self.next();
+            let idx = self.expr(1)?;
+            if !self.peek().map(|x| x.s == ")").unwrap_or(false) {
+                return Err("多次元の添字は未対応".into());
+            }
+            self.next();
+            return Ok(Expr::Idx(n, Box::new(idx)));
+        }
         Ok(Expr::Var(n))
     }
     fn prec(op: &str) -> Option<(u8, char)> {
@@ -276,6 +407,14 @@ impl P {
             self.i = save; // 式の括弧だった
         }
         let a = self.expr(1)?;
+        if let Expr::Var(n) = &a {
+            let cmp_next = matches!(self.word().as_str(), "=" | ">" | "<" | ">=" | "<=" | "EQUAL" | "GREATER" | "LESS" | "IS" | "NOT");
+            if !cmp_next {
+                if let Some(c) = self.cond_of_name(n) {
+                    return Ok(c);
+                }
+            }
+        }
         let mut neg = false;
         let mut w = self.word();
         if w == "IS" {
@@ -286,6 +425,11 @@ impl P {
             neg = true;
             self.next();
             w = self.word();
+        }
+        if matches!(w.as_str(), "NUMERIC" | "ALPHABETIC" | "ALPHABETIC-LOWER" | "ALPHABETIC-UPPER") {
+            self.next();
+            let c = Cond::Class(a, w);
+            return Ok(if neg { Cond::Not(Box::new(c)) } else { c });
         }
         let op = match w.as_str() {
             "=" | "EQUAL" => {
@@ -362,7 +506,7 @@ impl P {
     }
 
     fn names_until(&mut self, stops: &[&str]) -> Vec<String> {
-        let mut v = vec![];
+        let mut v: Vec<String> = vec![];
         while let Some(t) = self.peek() {
             let u = t.s.to_uppercase();
             if is_starter(&u) || stops.contains(&u.as_str()) || t.s == ")" {
@@ -370,10 +514,40 @@ impl P {
             }
             let (s, d) = (t.s.clone(), t.dot);
             self.next();
-            if u != "ROUNDED" {
+            if u == "ROUNDED" {
+                if let Some(l) = v.last_mut() {
+                    l.push('\u{1}');
+                }
+            } else {
                 let n = ident(&s);
                 self.used.insert(n.clone());
-                v.push(n);
+                let sub = if !d && self.peek().map(|x| x.s == "(").unwrap_or(false) {
+                    let save = self.i;
+                    self.next();
+                    match self.expr(1) {
+                        Ok(ix) if self.peek().map(|x| x.s == ")").unwrap_or(false) => {
+                            let dd = self.next().map(|x| x.dot).unwrap_or(false);
+                            self.subs.push(ix);
+                            if dd {
+                                self.ended = true;
+                            }
+                            Some(self.subs.len() - 1)
+                        }
+                        _ => {
+                            self.i = save;
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                match sub {
+                    Some(k) => v.push(format!("{n}\0{k}")),
+                    None => v.push(n),
+                }
+                if self.ended && sub.is_some() {
+                    break;
+                }
             }
             if d {
                 break;
@@ -394,12 +568,40 @@ impl P {
                 // 直前で文が終わっている(空の文)
                 break;
             }
+            if u == "ROUNDED" {
+                self.next();
+                match v.pop() {
+                    Some(Expr::Var(n)) => v.push(Expr::Var(format!("{n}\u{1}"))),
+                    Some(Expr::Idx(n, i)) => v.push(Expr::Idx(format!("{n}\u{1}"), i)),
+                    Some(o) => v.push(o),
+                    None => {}
+                }
+                if self.ended {
+                    break;
+                }
+                continue;
+            }
             v.push(self.operand()?);
             if self.ended {
                 break;
             }
         }
         Ok(v)
+    }
+
+    /// 終端語(END-xxx)または文末(.)まで読み飛ばす(文が既に終わっていれば何もしない)
+    fn skip_through(&mut self, endw: &str) {
+        if self.ended {
+            return;
+        }
+        while let Some(t) = self.peek() {
+            let e = t.s.to_uppercase() == endw;
+            let d = t.dot;
+            self.next();
+            if e || d {
+                break;
+            }
+        }
     }
 
     fn sum(es: Vec<Expr>) -> Expr {
@@ -441,7 +643,20 @@ impl P {
                 self.next();
                 let ops = self.operands_until(&["UPON", "WITH", "NO"]);
                 match ops {
-                    Ok(o) => Stmt::Display(o),
+                    Ok(o) => {
+                        if self.word() == "UPON" {
+                            self.next();
+                            self.next();
+                        }
+                        if self.word() == "WITH" && self.up(1) == "NO" && self.up(2) == "ADVANCING" {
+                            self.next();
+                            self.next();
+                            self.next();
+                            Stmt::DisplayNoNl(o)
+                        } else {
+                            Stmt::Display(o)
+                        }
+                    }
                     Err(e) => {
                         self.skip_to_end(&[]);
                         Stmt::Todo(format!("DISPLAY: {e}"))
@@ -480,7 +695,7 @@ impl P {
                         let total = Self::sum(ops);
                         let mut out = vec![];
                         for t in to {
-                            if let Expr::Var(n) = t {
+                            if let Some(n) = self.lv_of(t) {
                                 out.push(Stmt::AddTo(n, total.clone()));
                             }
                         }
@@ -509,9 +724,9 @@ impl P {
                         let g = self.names_until(&[]);
                         return Ok(Stmt::Assign(g.into_iter().next().ok_or("GIVING 先が無い")?, Expr::Bin('-', Box::new(from), Box::new(sum))));
                     }
-                    match from {
-                        Expr::Var(n) => Ok(Stmt::SubFrom(n, sum)),
-                        _ => Err("FROM の先が変数ではない".into()),
+                    match self.lv_of(from) {
+                        Some(n) => Ok(Stmt::SubFrom(n, sum)),
+                        None => Err("FROM の先が変数ではない".into()),
                     }
                 })();
                 r.unwrap_or_else(|e| Stmt::Todo(format!("SUBTRACT: {e}")))
@@ -530,9 +745,9 @@ impl P {
                         let g = self.names_until(&[]);
                         return Ok(Stmt::Assign(g.into_iter().next().ok_or("GIVING 先が無い")?, Expr::Bin('*', Box::new(a), Box::new(b))));
                     }
-                    match b {
-                        Expr::Var(n) => Ok(Stmt::MulBy(n, a)),
-                        _ => Err("BY の先が変数ではない".into()),
+                    match self.lv_of(b) {
+                        Some(n) => Ok(Stmt::MulBy(n, a)),
+                        None => Err("BY の先が変数ではない".into()),
                     }
                 })();
                 r.unwrap_or_else(|e| Stmt::Todo(format!("MULTIPLY: {e}")))
@@ -550,14 +765,20 @@ impl P {
                     if self.word() == "GIVING" {
                         self.next();
                         let g = self.names_until(&["REMAINDER"]);
+                        let q = g.into_iter().next().ok_or("GIVING 先が無い")?;
+                        let (dividend, divisor) = if by { (a, b) } else { (b, a) };
+                        let e = Expr::Bin('/', Box::new(dividend.clone()), Box::new(divisor.clone()));
                         if self.word() == "REMAINDER" {
-                            return Err("REMAINDER は未対応".into());
+                            self.next();
+                            let r = self.names_until(&[]).into_iter().next().ok_or("REMAINDER 先が無い")?;
+                            let qv = Expr::Var(q.split(['\0', '\u{1}']).next().unwrap_or("").to_string());
+                            let rem = Expr::Bin('-', Box::new(dividend), Box::new(Expr::Bin('*', Box::new(qv), Box::new(divisor))));
+                            return Ok(Stmt::If(Cond::Cmp("==".into(), Expr::Num("1".into()), Expr::Num("1".into())), vec![Stmt::Assign(q, e), Stmt::Assign(r, rem)], vec![]));
                         }
-                        let e = if by { Expr::Bin('/', Box::new(a), Box::new(b)) } else { Expr::Bin('/', Box::new(b), Box::new(a)) };
-                        return Ok(Stmt::Assign(g.into_iter().next().ok_or("GIVING 先が無い")?, e));
+                        return Ok(Stmt::Assign(q, e));
                     }
-                    match b {
-                        Expr::Var(n) if !by => Ok(Stmt::Assign(n.clone(), Expr::Bin('/', Box::new(Expr::Var(n)), Box::new(a)))),
+                    match self.lv_of(b) {
+                        Some(n) if !by => Ok(Stmt::Assign(n.clone(), Expr::Bin('/', Box::new(Expr::Var(n.split(['\0', '\u{1}']).next().unwrap_or("").to_string())), Box::new(a)))),
                         _ => Err("DIVIDE の形が未対応".into()),
                     }
                 })();
@@ -705,9 +926,16 @@ impl P {
                 let w = self.word();
                 let inline = w == "VARYING" || w == "UNTIL" || (self.up(1) == "TIMES");
                 let mut call: Option<String> = None;
+                let mut thru: Option<String> = None;
                 if !inline && w != "VARYING" && w != "UNTIL" {
                     let n = self.next().unwrap();
                     call = Some(ident(&n.s));
+                    if matches!(self.word().as_str(), "THRU" | "THROUGH") {
+                        self.next();
+                        if let Some(b) = self.next() {
+                            thru = Some(ident(&b.s));
+                        }
+                    }
                 }
                 let r: Result<Loop, String> = (|| {
                     let w = self.word();
@@ -767,7 +995,10 @@ impl P {
                             }
                         }
                         let body = match call {
-                            Some(c) => vec![Stmt::Call(c)],
+                            Some(c) => match thru {
+                                Some(t) => vec![Stmt::Thru(c, t)],
+                                None => vec![Stmt::Call(c)],
+                            },
                             None => {
                                 let b = self.block(false, &["END-PERFORM"]);
                                 if self.word() == "END-PERFORM" {
@@ -802,7 +1033,432 @@ impl P {
                     Stmt::Nop
                 }
             }
-            "ELSE" | "END-IF" | "END-PERFORM" | "WHEN" | "END-EVALUATE" => {
+            "GO" => {
+                self.next();
+                if self.word() == "TO" {
+                    self.next();
+                }
+                let mut names = vec![];
+                while let Some(t) = self.peek() {
+                    let u = t.s.to_uppercase();
+                    if u == "DEPENDING" || is_starter(&u) {
+                        break;
+                    }
+                    let d = t.dot;
+                    names.push(ident(&t.s));
+                    self.next();
+                    if d {
+                        break;
+                    }
+                }
+                if !self.ended && self.word() == "DEPENDING" {
+                    self.next();
+                    if self.word() == "ON" {
+                        self.next();
+                    }
+                    match self.expr(1) {
+                        Ok(x) => {
+                            let mut tail: Vec<Stmt> = vec![];
+                            for (k, n) in names.iter().enumerate().rev() {
+                                tail = vec![Stmt::If(Cond::Cmp("==".into(), x.clone(), Expr::Num((k + 1).to_string())), vec![Stmt::Goto(n.clone())], tail)];
+                            }
+                            bundle(tail)
+                        }
+                        Err(e) => Stmt::Todo(format!("GO TO DEPENDING: {e}")),
+                    }
+                } else if let Some(n) = names.into_iter().next() {
+                    Stmt::Goto(n)
+                } else {
+                    Stmt::Todo("GO TO".into())
+                }
+            }
+            "INITIALIZE" => {
+                self.next();
+                let n = self.names_until(&["REPLACING", "WITH", "TO", "ALL"]);
+                if !self.ended && matches!(self.word().as_str(), "REPLACING" | "WITH" | "TO" | "ALL") {
+                    self.skip_to_end(&[]);
+                    Stmt::Todo("INITIALIZE の REPLACING / WITH FILLER は未対応".into())
+                } else {
+                    Stmt::Initialize(n)
+                }
+            }
+            "SET" => {
+                self.next();
+                let r: Result<Stmt, String> = (|| {
+                    let tg = self.names_until(&["TO", "UP", "DOWN"]);
+                    let t = tg.into_iter().next().ok_or("SET 先が無い")?;
+                    let w = self.word();
+                    if w == "TO" {
+                        self.next();
+                        if self.word() == "TRUE" {
+                            self.next();
+                            let base = t.split(['\0', '\u{1}']).next().unwrap_or("").to_string();
+                            let c = self.conds.iter().find(|c| c.name == base).ok_or("条件名が未定義")?;
+                            let v = c.values.first().ok_or("条件名に値が無い")?.0.clone();
+                            return Ok(Stmt::Move(v, vec![c.parent.clone()]));
+                        }
+                        if self.word() == "FALSE" {
+                            return Err("SET ... TO FALSE は未対応".into());
+                        }
+                        let e = self.expr(1)?;
+                        return Ok(Stmt::Move(e, vec![t]));
+                    }
+                    if w == "UP" || w == "DOWN" {
+                        self.next();
+                        if self.word() != "BY" {
+                            return Err("BY が無い".into());
+                        }
+                        self.next();
+                        let e = self.expr(1)?;
+                        return Ok(if w == "UP" { Stmt::AddTo(t, e) } else { Stmt::SubFrom(t, e) });
+                    }
+                    Err("SET の形が未対応".into())
+                })();
+                r.unwrap_or_else(|e| {
+                    self.skip_to_end(&[]);
+                    Stmt::Todo(format!("SET: {e}"))
+                })
+            }
+            "ACCEPT" => {
+                self.next();
+                let tg = self.names_until(&["FROM"]);
+                if !self.ended && self.word() == "FROM" {
+                    self.skip_to_end(&[]);
+                    Stmt::Todo("ACCEPT FROM DATE/TIME 等は未対応".into())
+                } else if let Some(t) = tg.into_iter().next() {
+                    Stmt::Accept(t)
+                } else {
+                    Stmt::Todo("ACCEPT".into())
+                }
+            }
+            "STRING" => {
+                self.next();
+                let r: Result<Stmt, String> = (|| {
+                    let mut srcs: Vec<(Expr, Option<Expr>)> = vec![];
+                    loop {
+                        let ops = self.operands_until(&["DELIMITED", "INTO"])?;
+                        if self.word() == "DELIMITED" {
+                            self.next();
+                            if self.word() == "BY" {
+                                self.next();
+                            }
+                            let d = if self.word() == "SIZE" {
+                                self.next();
+                                None
+                            } else if matches!(self.word().as_str(), "SPACE" | "SPACES") {
+                                self.next();
+                                Some(Expr::Str(" ".into()))
+                            } else {
+                                Some(self.operand()?)
+                            };
+                            for o in ops {
+                                srcs.push((o, d.clone()));
+                            }
+                            if self.word() == "INTO" {
+                                break;
+                            }
+                        } else {
+                            for o in ops {
+                                srcs.push((o, None));
+                            }
+                            break;
+                        }
+                    }
+                    if self.word() != "INTO" {
+                        return Err("INTO が無い".into());
+                    }
+                    self.next();
+                    let tg = self.names_until(&["WITH", "ON", "NOT", "POINTER"]).into_iter().next().ok_or("INTO 先が無い")?;
+                    if !self.ended && matches!(self.word().as_str(), "WITH" | "ON" | "NOT" | "POINTER") {
+                        return Err("POINTER / ON OVERFLOW は未対応".into());
+                    }
+                    if !self.ended && self.word() == "END-STRING" {
+                        let d = self.peek().map(|t| t.dot).unwrap_or(false);
+                        self.next();
+                        self.ended = d;
+                    }
+                    Ok(Stmt::Str(srcs, tg))
+                })();
+                r.unwrap_or_else(|e| {
+                    self.skip_through("END-STRING");
+                    Stmt::Todo(format!("STRING: {e}"))
+                })
+            }
+            "UNSTRING" => {
+                self.next();
+                let r: Result<Stmt, String> = (|| {
+                    let src = self.operand()?;
+                    if self.word() != "DELIMITED" {
+                        return Err("DELIMITED BY が無い".into());
+                    }
+                    self.next();
+                    if self.word() == "BY" {
+                        self.next();
+                    }
+                    let all = self.word() == "ALL";
+                    if all {
+                        self.next();
+                    }
+                    let d = if matches!(self.word().as_str(), "SPACE" | "SPACES") {
+                        self.next();
+                        Expr::Str(" ".into())
+                    } else {
+                        self.operand()?
+                    };
+                    if self.word() != "INTO" {
+                        return Err("INTO が無い".into());
+                    }
+                    self.next();
+                    let tg = self.names_until(&["TALLYING", "ON", "NOT", "WITH", "DELIMITER", "COUNT"]);
+                    if !self.ended && matches!(self.word().as_str(), "TALLYING" | "ON" | "NOT" | "WITH" | "DELIMITER" | "COUNT") {
+                        return Err("TALLYING / COUNT / ON OVERFLOW は未対応".into());
+                    }
+                    if !self.ended && self.word() == "END-UNSTRING" {
+                        let dd = self.peek().map(|t| t.dot).unwrap_or(false);
+                        self.next();
+                        self.ended = dd;
+                    }
+                    Ok(Stmt::Unstring(src, d, all, tg))
+                })();
+                r.unwrap_or_else(|e| {
+                    self.skip_through("END-UNSTRING");
+                    Stmt::Todo(format!("UNSTRING: {e}"))
+                })
+            }
+            "INSPECT" => {
+                self.next();
+                let r: Result<Stmt, String> = (|| {
+                    let tg = ident(&self.next().ok_or("INSPECT 対象が無い")?.s);
+                    self.used.insert(tg.clone());
+                    let st = match self.word().as_str() {
+                        "TALLYING" => {
+                            self.next();
+                            let c = ident(&self.next().ok_or("カウンタが無い")?.s);
+                            self.used.insert(c.clone());
+                            if self.word() != "FOR" || self.up(1) != "ALL" {
+                                return Err("TALLYING は FOR ALL のみ対応".into());
+                            }
+                            self.next();
+                            self.next();
+                            Stmt::Inspect(tg, Inspect::Tally(c, self.operand()?))
+                        }
+                        "REPLACING" => {
+                            self.next();
+                            let first = match self.word().as_str() {
+                                "ALL" => false,
+                                "FIRST" => true,
+                                _ => return Err("REPLACING は ALL / FIRST のみ対応".into()),
+                            };
+                            self.next();
+                            let from = self.operand()?;
+                            if self.word() != "BY" {
+                                return Err("BY が無い".into());
+                            }
+                            self.next();
+                            let to = self.operand()?;
+                            Stmt::Inspect(tg, Inspect::Replace { first, from, to })
+                        }
+                        "CONVERTING" => {
+                            self.next();
+                            let a = self.operand()?;
+                            if self.word() != "TO" {
+                                return Err("TO が無い".into());
+                            }
+                            self.next();
+                            let b = self.operand()?;
+                            Stmt::Inspect(tg, Inspect::Convert(a, b))
+                        }
+                        _ => return Err("INSPECT の形が未対応".into()),
+                    };
+                    if !self.ended && matches!(self.word().as_str(), "BEFORE" | "AFTER") {
+                        return Err("BEFORE/AFTER INITIAL は未対応".into());
+                    }
+                    Ok(st)
+                })();
+                r.unwrap_or_else(|e| {
+                    self.skip_to_end(&[]);
+                    Stmt::Todo(format!("INSPECT: {e}"))
+                })
+            }
+            "CALL" => {
+                self.next();
+                let r: Result<Stmt, String> = (|| {
+                    let name = match self.operand()? {
+                        Expr::Str(s) => s,
+                        _ => return Err("動的 CALL(変数でプログラム名を指定)は未対応".into()),
+                    };
+                    let mut args = vec![];
+                    if !self.ended && self.word() == "USING" {
+                        self.next();
+                        while !self.ended {
+                            let w = self.word();
+                            if matches!(w.as_str(), "BY" | "REFERENCE" | "CONTENT" | "VALUE") {
+                                self.next();
+                                continue;
+                            }
+                            if w.is_empty() || is_starter(&w) || matches!(w.as_str(), "RETURNING" | "ON" | "NOT") {
+                                break;
+                            }
+                            args.push(self.operand()?);
+                        }
+                    }
+                    let mut v = vec![Stmt::CallExt(name, args)];
+                    if !self.ended && matches!(self.word().as_str(), "ON" | "NOT" | "RETURNING") {
+                        self.skip_through("END-CALL");
+                        v.push(Stmt::Todo("CALL の RETURNING / ON EXCEPTION は未対応".into()));
+                    } else if !self.ended && self.word() == "END-CALL" {
+                        let d = self.peek().map(|t| t.dot).unwrap_or(false);
+                        self.next();
+                        self.ended = d;
+                    }
+                    Ok(bundle(v))
+                })();
+                r.unwrap_or_else(|e| {
+                    self.skip_through("END-CALL");
+                    Stmt::Todo(format!("CALL: {e}"))
+                })
+            }
+            "EXEC" => {
+                let kind = self.up(1);
+                self.skip_through("END-EXEC");
+                Stmt::Todo(format!("EXEC {kind}(埋め込み SQL/CICS)は未対応"))
+            }
+            "OPEN" => {
+                self.next();
+                let mut out: Vec<Stmt> = vec![];
+                let mut mode = String::new();
+                while let Some(t) = self.peek() {
+                    let w = t.s.to_uppercase();
+                    if matches!(w.as_str(), "INPUT" | "OUTPUT" | "EXTEND" | "I-O") {
+                        mode = match w.as_str() {
+                            "INPUT" => "input",
+                            "OUTPUT" => "output",
+                            "EXTEND" => "extend",
+                            _ => "io",
+                        }
+                        .into();
+                        self.next();
+                        continue;
+                    }
+                    if is_starter(&w) {
+                        break;
+                    }
+                    let (n, d) = (ident(&t.s), t.dot);
+                    self.next();
+                    if self.file_named(&n).is_some() && !mode.is_empty() {
+                        out.push(Stmt::Open(n, mode.clone()));
+                    } else {
+                        out.push(Stmt::Todo(format!("OPEN {n}: ファイル定義(SELECT)または入出力モードが無い")));
+                    }
+                    if d {
+                        break;
+                    }
+                }
+                if out.is_empty() {
+                    out.push(Stmt::Todo("OPEN".into()));
+                }
+                bundle(out)
+            }
+            "CLOSE" => {
+                self.next();
+                let mut out: Vec<Stmt> = vec![];
+                while let Some(t) = self.peek() {
+                    if is_starter(&t.s) {
+                        break;
+                    }
+                    let (n, d) = (ident(&t.s), t.dot);
+                    self.next();
+                    if self.file_named(&n).is_some() {
+                        out.push(Stmt::Close(n));
+                    } else {
+                        out.push(Stmt::Todo(format!("CLOSE {n}: ファイル定義(SELECT)が無い")));
+                    }
+                    if d {
+                        break;
+                    }
+                }
+                if out.is_empty() {
+                    out.push(Stmt::Todo("CLOSE".into()));
+                }
+                bundle(out)
+            }
+            "READ" => {
+                self.next();
+                let r: Result<Stmt, String> = (|| {
+                    let f = ident(&self.next().ok_or("ファイル名が無い")?.s);
+                    if self.file_named(&f).is_none() {
+                        return Err(format!("{f}: ファイル定義(SELECT)が無い"));
+                    }
+                    if !self.ended && self.word() == "NEXT" {
+                        self.next();
+                    }
+                    if !self.ended && self.word() == "RECORD" {
+                        self.next();
+                    }
+                    let mut into = None;
+                    if !self.ended && self.word() == "INTO" {
+                        self.next();
+                        let n = ident(&self.next().ok_or("INTO 先が無い")?.s);
+                        self.used.insert(n.clone());
+                        into = Some(n);
+                    }
+                    if !self.ended && matches!(self.word().as_str(), "INVALID" | "KEY") {
+                        return Err("INVALID KEY(索引/相対ファイル)は未対応".into());
+                    }
+                    let (mut at_end, mut not_at_end) = (vec![], vec![]);
+                    if !self.ended && self.word() == "AT" && self.up(1) == "END" {
+                        self.next();
+                        self.next();
+                        at_end = self.block(true, &["NOT", "END-READ"]);
+                    }
+                    if !self.ended && self.word() == "NOT" && self.up(1) == "AT" && self.up(2) == "END" {
+                        self.next();
+                        self.next();
+                        self.next();
+                        not_at_end = self.block(true, &["END-READ"]);
+                    }
+                    if !self.ended && self.word() == "END-READ" {
+                        let d = self.peek().map(|t| t.dot).unwrap_or(false);
+                        self.next();
+                        self.ended = d;
+                    }
+                    Ok(Stmt::Read(f, into, at_end, not_at_end))
+                })();
+                r.unwrap_or_else(|e| {
+                    self.skip_through("END-READ");
+                    Stmt::Todo(format!("READ: {e}"))
+                })
+            }
+            "WRITE" => {
+                self.next();
+                let r: Result<Stmt, String> = (|| {
+                    let rec = ident(&self.next().ok_or("レコード名が無い")?.s);
+                    let f = self.files.iter().find(|f| f.record == rec).map(|f| f.name.clone()).ok_or_else(|| format!("{rec}: レコードが FD に無い"))?;
+                    let mut from = None;
+                    if !self.ended && self.word() == "FROM" {
+                        self.next();
+                        from = Some(self.operand()?);
+                    }
+                    let mut v = vec![Stmt::Write(f, from)];
+                    if !self.ended && matches!(self.word().as_str(), "AFTER" | "BEFORE") {
+                        self.skip_through("END-WRITE");
+                        v.push(Stmt::Todo("WRITE の ADVANCING(行送り)は無視し改行のみ".into()));
+                    } else if !self.ended && matches!(self.word().as_str(), "INVALID" | "AT" | "NOT") {
+                        self.skip_through("END-WRITE");
+                        v.push(Stmt::Todo("WRITE の INVALID KEY / EOP は未対応".into()));
+                    } else if !self.ended && self.word() == "END-WRITE" {
+                        let d = self.peek().map(|t| t.dot).unwrap_or(false);
+                        self.next();
+                        self.ended = d;
+                    }
+                    Ok(bundle(v))
+                })();
+                r.unwrap_or_else(|e| {
+                    self.skip_through("END-WRITE");
+                    Stmt::Todo(format!("WRITE: {e}"))
+                })
+            }
+            "ELSE" | "END-IF" | "END-PERFORM" | "WHEN" | "END-EVALUATE" | "END-READ" | "END-CALL" | "END-STRING" | "END-UNSTRING" | "END-WRITE" | "END-SEARCH" | "END-ACCEPT" | "END-DISPLAY" | "END-COMPUTE" | "END-ADD" | "END-SUBTRACT" | "END-MULTIPLY" | "END-DIVIDE" | "END-EXEC" => {
                 // 対応する開始が無い終端語: 読み飛ばす
                 self.next();
                 Stmt::Nop
@@ -821,6 +1477,57 @@ impl P {
     }
 }
 
+/// 複数の文を1つの文として束ねる(1個ならそのまま)
+fn bundle(v: Vec<Stmt>) -> Stmt {
+    if v.len() == 1 {
+        v.into_iter().next().unwrap()
+    } else {
+        Stmt::If(Cond::Cmp("==".into(), Expr::Num("1".into()), Expr::Num("1".into())), v, vec![])
+    }
+}
+
+/// PIC 文字列 → (数値か, 桁数, 小数桁)
+fn pic_info(pc: &str) -> (bool, usize, u32) {
+    let u = pc.trim_end_matches('.').to_uppercase();
+    let c: Vec<char> = u.chars().collect();
+    let mut exp: Vec<char> = vec![];
+    let mut i = 0;
+    while i < c.len() {
+        if c[i] == '(' {
+            let mut j = i + 1;
+            let mut n = 0usize;
+            while j < c.len() && c[j] != ')' {
+                n = n * 10 + c[j].to_digit(10).unwrap_or(0) as usize;
+                j += 1;
+            }
+            if let Some(&last) = exp.last() {
+                for _ in 1..n {
+                    exp.push(last);
+                }
+            }
+            i = j + 1;
+        } else {
+            exp.push(c[i]);
+            i += 1;
+        }
+    }
+    let numeric = u.starts_with('9') || u.starts_with("S9") || u.starts_with("V9");
+    let (mut width, mut scale, mut after) = (0usize, 0u32, false);
+    for ch in exp {
+        match ch {
+            'V' | '.' => after = true,
+            'S' => {}
+            _ => {
+                width += 1;
+                if after && numeric {
+                    scale += 1;
+                }
+            }
+        }
+    }
+    (numeric, width, scale)
+}
+
 fn level(t: &str) -> bool {
     t.len() == 2 && t.chars().all(|c| c.is_ascii_digit()) && (t == "77" || t.parse::<u8>().map(|n| (1..=49).contains(&n)).unwrap_or(false))
 }
@@ -833,65 +1540,223 @@ pub fn parse(src: &str, free: bool) -> Program {
     let head_end = proc_at.unwrap_or(toks.len());
     // データ部
     let mut i = 0;
+    let mut cur_fd: Option<usize> = None;
+    let mut last_var: Option<String> = None;
+    let mut group_occurs: Option<(u8, usize)> = None;
+    let mut filler_n = 0usize;
+    let lit = |s: &str| -> Expr {
+        let u = s.to_uppercase();
+        match u.as_str() {
+            "ZERO" | "ZEROS" | "ZEROES" => Expr::Num("0".into()),
+            "SPACE" | "SPACES" => Expr::Str(String::new()),
+            _ if s.starts_with('"') || s.starts_with('\'') => Expr::Str(s[1..s.len().saturating_sub(1)].to_string()),
+            _ => Expr::Num(s.to_string()),
+        }
+    };
     while i < head_end {
         let u = toks[i].s.to_uppercase();
+        // この項目の終わり(最初に文末ドットを持つトークン)
+        let mut k = i;
+        while k < head_end && !toks[k].dot {
+            k += 1;
+        }
+        let end = (k + 1).min(head_end);
         if u == "PROGRAM-ID" {
             p.id = toks.get(i + 1).map(|t| t.s.clone()).unwrap_or_default();
             i += 2;
-        } else if level(&toks[i].s) && !toks[i].dot {
-            let name = toks.get(i + 1).map(|t| t.s.clone()).unwrap_or_default();
-            let mut j = i + 2;
-            while j < head_end && !toks[j - 1].dot && !(j == i + 2 && toks[i + 1].dot) {
-                if toks[j].dot {
-                    j += 1;
-                    break;
+        } else if u == "SELECT" {
+            let seg: Vec<String> = toks[i..end].iter().map(|t| t.s.to_uppercase()).collect();
+            let raw: Vec<String> = toks[i..end].iter().map(|t| t.s.clone()).collect();
+            let mut f = FileDef { name: ident(&raw.get(1).cloned().unwrap_or_default()), ..Default::default() };
+            let mut x = 2;
+            while x < seg.len() {
+                match seg[x].as_str() {
+                    "ASSIGN" => {
+                        x += 1;
+                        while x < raw.len() && matches!(seg[x].as_str(), "TO" | "DISK" | "EXTERNAL" | "DYNAMIC") {
+                            x += 1;
+                        }
+                        if let Some(a) = raw.get(x) {
+                            let a = a.trim_end_matches('.').to_string();
+                            f.assign_lit = a.starts_with('"') || a.starts_with('\'');
+                            f.assign = if f.assign_lit { a[1..a.len().saturating_sub(1)].to_string() } else { a };
+                        }
+                    }
+                    "STATUS" if x > 0 && seg[x - 1] == "FILE" => {
+                        x += 1;
+                        if seg.get(x).map(|s| s == "IS").unwrap_or(false) {
+                            x += 1;
+                        }
+                        f.status = raw.get(x).map(|s| ident(s.trim_end_matches('.')));
+                    }
+                    "INDEXED" | "RELATIVE" => p.notes.push(format!("SELECT {}: ORGANIZATION {} は未対応(順編成として扱う)", raw[1], seg[x])),
+                    _ => {}
                 }
-                j += 1;
+                x += 1;
             }
-            let seg: Vec<String> = toks[(i + 2).min(head_end)..j.min(head_end)].iter().map(|t| t.s.clone()).collect();
-            let mut numeric = false;
-            let mut decimal = false;
+            p.files.push(f);
+            i = end;
+        } else if u == "FD" {
+            let n = ident(toks.get(i + 1).map(|t| t.s.trim_end_matches('.')).unwrap_or(""));
+            cur_fd = p.files.iter().position(|f| f.name == n);
+            if cur_fd.is_none() {
+                p.notes.push(format!("FD {n}: 対応する SELECT が無い"));
+            }
+            i = end;
+        } else if matches!(u.as_str(), "WORKING-STORAGE" | "LOCAL-STORAGE" | "LINKAGE") {
+            cur_fd = None;
+            i += 1;
+        } else if u == "COPY" {
+            p.notes.push(format!("COPY {} が展開されていない(コピー句が見つからない)", toks.get(i + 1).map(|t| t.s.as_str()).unwrap_or("")));
+            i = end;
+        } else if toks[i].s == "88" && !toks[i].dot {
+            let name = ident(toks.get(i + 1).map(|t| t.s.trim_end_matches('.')).unwrap_or(""));
+            let seg: Vec<&Tok> = toks[(i + 2).min(end)..end].iter().collect();
+            let mut values: Vec<(Expr, Option<Expr>)> = vec![];
+            let mut x = 0;
+            while x < seg.len() {
+                let w = seg[x].s.to_uppercase();
+                if matches!(w.as_str(), "VALUE" | "VALUES" | "IS" | "ARE") {
+                    x += 1;
+                    continue;
+                }
+                let a = lit(seg[x].s.trim_end_matches('.'));
+                if seg.get(x + 1).map(|t| matches!(t.s.to_uppercase().as_str(), "THRU" | "THROUGH")).unwrap_or(false) {
+                    if let Some(b) = seg.get(x + 2) {
+                        values.push((a, Some(lit(b.s.trim_end_matches('.')))));
+                        x += 3;
+                        continue;
+                    }
+                }
+                values.push((a, None));
+                x += 1;
+            }
+            match &last_var {
+                Some(parent) if !values.is_empty() => p.conds.push(CondName { name, parent: parent.clone(), values }),
+                _ => p.notes.push(format!("88 {name}: 親の項目または値が見つからない")),
+            }
+            i = end;
+        } else if level(&toks[i].s) && !toks[i].dot {
+            let lvl: u8 = toks[i].s.parse().unwrap_or(1);
+            let name = toks.get(i + 1).map(|t| t.s.trim_end_matches('.').to_string()).unwrap_or_default();
+            let seg: Vec<String> = if k >= i + 2 { toks[i + 2..end].iter().map(|t| t.s.clone()).collect() } else { vec![] };
+            let mut pic = (false, 0usize, 0u32);
             let mut init = String::new();
             let mut has_pic = false;
-            let mut k = 0;
-            while k < seg.len() {
-                match seg[k].to_uppercase().as_str() {
+            let mut occurs = 0usize;
+            let mut redef: Option<String> = None;
+            let mut x = 0;
+            while x < seg.len() {
+                match seg[x].to_uppercase().as_str() {
                     "PIC" | "PICTURE" => {
                         has_pic = true;
-                        let mut pc = seg.get(k + 1).cloned().unwrap_or_default();
+                        let mut pc = seg.get(x + 1).cloned().unwrap_or_default();
                         if pc.to_uppercase() == "IS" {
-                            pc = seg.get(k + 2).cloned().unwrap_or_default();
+                            pc = seg.get(x + 2).cloned().unwrap_or_default();
                         }
-                        let u = pc.to_uppercase();
-                        numeric = u.starts_with('9') || u.starts_with("S9") || u.starts_with("V9");
-                        decimal = numeric && (u.contains('V') || u.contains('.'));
+                        let mut y = x + if seg.get(x + 1).map(|s| s.to_uppercase() == "IS").unwrap_or(false) { 3 } else { 2 };
+                        loop {
+                            if seg.get(y).map(|s| s == "(").unwrap_or(false) {
+                                pc.push('(');
+                                pc.push_str(seg.get(y + 1).map(|s| s.as_str()).unwrap_or(""));
+                                pc.push(')');
+                                y += 3;
+                            } else if y > 0 && seg.get(y - 1).map(|s| s == ")").unwrap_or(false) && seg.get(y).map(|s| !s.is_empty() && s.chars().all(|c| "9XAVSZB.+-*$,/0".contains(c.to_ascii_uppercase()))).unwrap_or(false) {
+                                pc.push_str(&seg[y]);
+                                y += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        pic = pic_info(&pc);
                     }
                     "VALUE" => {
-                        let mut v = seg.get(k + 1).cloned().unwrap_or_default();
+                        let mut v = seg.get(x + 1).cloned().unwrap_or_default();
                         if v.to_uppercase() == "IS" {
-                            v = seg.get(k + 2).cloned().unwrap_or_default();
+                            v = seg.get(x + 2).cloned().unwrap_or_default();
                         }
                         init = match v.to_uppercase().as_str() {
                             "ZERO" | "ZEROS" | "ZEROES" => "0".into(),
                             "SPACE" | "SPACES" => "\"\"".into(),
-                            _ => v,
+                            _ => v.trim_end_matches('.').to_string(),
                         };
                     }
+                    "OCCURS" => {
+                        occurs = seg.get(x + 1).and_then(|s| s.parse().ok()).unwrap_or(0);
+                        if seg.iter().any(|s| s.to_uppercase() == "DEPENDING") {
+                            p.notes.push(format!("OCCURS DEPENDING ON ({name}): 最大件数の固定長として扱う"));
+                            if seg.get(x + 2).map(|s| s.to_uppercase() == "TO").unwrap_or(false) {
+                                occurs = seg.get(x + 3).and_then(|s| s.parse().ok()).unwrap_or(occurs);
+                            }
+                        }
+                    }
+                    "REDEFINES" => redef = seg.get(x + 1).map(|s| s.trim_end_matches('.').to_string()),
                     _ => {}
                 }
-                k += 1;
+                x += 1;
             }
-            if has_pic && name.to_uppercase() != "FILLER" && !p.vars.iter().any(|v| v.name == name.trim_end_matches('.')) {
-                p.vars.push(Var { name: name.trim_end_matches('.').to_string(), numeric, init, decimal, undeclared: false });
+            if let Some((gl, _)) = group_occurs {
+                if lvl <= gl {
+                    group_occurs = None;
+                }
             }
-            i = j.max(i + 1);
+            if !has_pic && occurs > 0 {
+                group_occurs = Some((lvl, occurs));
+                occurs = 0;
+            }
+            if has_pic && occurs == 0 {
+                if let Some((_, n)) = group_occurs {
+                    occurs = n;
+                }
+            }
+            let is_filler = name.to_uppercase() == "FILLER";
+            if redef.is_some() && !has_pic {
+                p.notes.push(format!("REDEFINES(群項目){name}: 別領域として扱っている(メモリの重ね合わせは再現しない)"));
+            }
+            if has_pic && (cur_fd.is_some() || !is_filler) {
+                let (numeric, width, scale) = pic;
+                let vname = if is_filler {
+                    filler_n += 1;
+                    format!("filler_{filler_n}")
+                } else {
+                    name.clone()
+                };
+                let mut aliased = false;
+                if let Some(r) = &redef {
+                    let rid = ident(r);
+                    if let Some(t) = p.vars.iter().find(|v| ident(&v.name) == rid) {
+                        if t.numeric == numeric && t.scale == scale && t.width == width && t.occurs == occurs {
+                            p.alias.push((ident(&vname), rid));
+                            aliased = true;
+                        }
+                    }
+                    if !aliased {
+                        p.notes.push(format!("REDEFINES {r} ({name}): 型や桁が違うため別領域として扱っている(メモリの重ね合わせは再現しない)"));
+                    }
+                }
+                if !aliased && !p.vars.iter().any(|v| v.name == vname) {
+                    p.vars.push(Var { name: vname.clone(), numeric, init, decimal: scale > 0, undeclared: false, scale, width, occurs });
+                }
+                last_var = Some(ident(&vname));
+                if let Some(fi) = cur_fd {
+                    if !aliased {
+                        p.files[fi].fields.push(ident(&vname));
+                    }
+                }
+            }
+            if let Some(fi) = cur_fd {
+                if lvl == 1 {
+                    p.files[fi].record = ident(&name);
+                }
+            }
+            i = end.max(i + 1);
         } else {
             i += 1;
         }
     }
     // 手続き部
     if let Some(pa) = proc_at {
-        let mut st = P { t: toks[pa + 2..].to_vec(), i: 0, ended: false, used: BTreeSet::new() };
+        let mut st = P { t: toks[pa + 2..].to_vec(), i: 0, ended: false, used: BTreeSet::new(), subs: vec![], conds: p.conds.clone(), files: p.files.clone() };
         // PROCEDURE DIVISION [USING ...] . の見出しの残りを読み飛ばす
         if pa + 1 < toks.len() && !toks[pa + 1].dot {
             while let Some(t) = st.peek() {
@@ -934,9 +1799,11 @@ pub fn parse(src: &str, free: bool) -> Program {
         }
         // 宣言の無い変数を足す(段落名は除く)
         let paras: Vec<String> = p.paragraphs.iter().map(|x| x.0.clone()).collect();
+        p.subs = std::mem::take(&mut st.subs);
+        let known: Vec<String> = p.conds.iter().map(|c| c.name.clone()).chain(p.files.iter().map(|f| f.name.clone())).chain(p.alias.iter().map(|a| a.0.clone())).collect();
         for u in st.used {
-            if !p.vars.iter().any(|v| ident(&v.name) == u) && !paras.contains(&u) {
-                p.vars.push(Var { name: u, numeric: true, init: String::new(), decimal: false, undeclared: true });
+            if !p.vars.iter().any(|v| ident(&v.name) == u) && !paras.contains(&u) && !known.contains(&u) {
+                p.vars.push(Var { name: u, numeric: true, undeclared: true, ..Default::default() });
             }
         }
     }
@@ -951,35 +1818,284 @@ enum Lang {
     Rs,
 }
 
-fn expr(e: &Expr, l: Lang) -> String {
-    match e {
-        Expr::Num(n) => n.clone(),
-        Expr::Str(s) => format!("{s:?}"),
-        Expr::Var(v) => format!("self.{v}"),
-        Expr::Neg(x) => format!("(-{})", expr(x, l)),
-        Expr::Bin('^', a, b) => match l {
-            Lang::Py => format!("({} ** {})", expr(a, l), expr(b, l)),
-            Lang::Rs => format!("({}).pow(({}) as u32)", expr(a, l), expr(b, l)),
-        },
-        Expr::Bin('/', a, b) => match l {
-            Lang::Py => format!("({} // {})", expr(a, l), expr(b, l)),
-            Lang::Rs => format!("({} / {})", expr(a, l), expr(b, l)),
-        },
-        Expr::Bin(o, a, b) => format!("({} {o} {})", expr(a, l), expr(b, l)),
+fn p10(k: u32) -> String {
+    10i64.pow(k).to_string()
+}
+
+fn canon(p: &Program, n: &str) -> String {
+    match p.alias.iter().find(|a| a.0 == n) {
+        Some(a) => a.1.clone(),
+        None => n.to_string(),
     }
 }
 
-fn cond(c: &Cond, l: Lang) -> String {
-    match c {
-        Cond::Cmp(o, a, b) => format!("{} {o} {}", expr(a, l), expr(b, l)),
-        Cond::And(a, b) => format!("({} {} {})", cond(a, l), if l == Lang::Py { "and" } else { "&&" }, cond(b, l)),
-        Cond::Or(a, b) => format!("({} {} {})", cond(a, l), if l == Lang::Py { "or" } else { "||" }, cond(b, l)),
-        Cond::Not(a) => format!("{}({})", if l == Lang::Py { "not " } else { "!" }, cond(a, l)),
+/// 代入先文字列 → (名前, 添字番号, ROUNDED)
+fn split_lv(t: &str) -> (String, Option<usize>, bool) {
+    let rounded = t.contains('\u{1}');
+    let t2 = t.replace('\u{1}', "");
+    match t2.split_once('\0') {
+        Some((n, k)) => (n.to_string(), k.parse().ok(), rounded),
+        None => (t2, None, rounded),
     }
+}
+
+fn var_of<'a>(p: &'a Program, n: &str) -> Option<&'a Var> {
+    let c = canon(p, n);
+    p.vars.iter().find(|v| ident(&v.name) == c)
+}
+
+fn scale_of(p: &Program, n: &str) -> u32 {
+    var_of(p, n).map(|v| v.scale).unwrap_or(0)
 }
 
 fn is_num(p: &Program, name: &str) -> bool {
-    p.vars.iter().any(|v| ident(&v.name) == name && v.numeric)
+    let (b, _, _) = split_lv(name);
+    var_of(p, &b).map(|v| v.numeric).unwrap_or(false)
+}
+
+fn is_numeric(p: &Program, e: &Expr) -> bool {
+    match e {
+        Expr::Num(_) | Expr::Neg(_) | Expr::Bin(..) => true,
+        Expr::Str(_) => false,
+        Expr::Var(v) | Expr::Idx(v, _) => {
+            let (b, _, _) = split_lv(v);
+            var_of(p, &b).map(|x| x.numeric).unwrap_or(true)
+        }
+        Expr::Func(n, _) => matches!(n.as_str(), "LENGTH" | "MAX" | "MIN" | "ABS" | "MOD" | "INTEGER" | "NUMVAL"),
+    }
+}
+
+/// 数値リテラル → (整数コード, 小数桁)
+fn lit_num(n: &str) -> (String, u32) {
+    let (neg, body) = match n.strip_prefix('-') {
+        Some(b) => (true, b),
+        None => (false, n.strip_prefix('+').unwrap_or(n)),
+    };
+    let (ip, fp) = body.split_once('.').unwrap_or((body, ""));
+    let digits = format!("{ip}{fp}");
+    let t = digits.trim_start_matches('0');
+    let t = if t.is_empty() { "0" } else { t };
+    (format!("{}{}", if neg && t != "0" { "-" } else { "" }, t), fp.len() as u32)
+}
+
+fn rescale(code: &str, from: u32, to: u32, rounded: bool, l: Lang) -> String {
+    if from == to {
+        return code.to_string();
+    }
+    if to > from {
+        return format!("({code} * {})", p10(to - from));
+    }
+    let d = p10(from - to);
+    match (rounded, l) {
+        (true, Lang::Py) => format!("_rdiv({code}, {d})"),
+        (true, Lang::Rs) => format!("rdiv({code}, {d})"),
+        (false, Lang::Py) => format!("_tdiv({code}, {d})"),
+        (false, Lang::Rs) => format!("({code} / {d})"),
+    }
+}
+
+fn disp(p: &Program, e: &Expr, l: Lang) -> String {
+    let (c, s) = sx(p, e, l);
+    if s > 0 && is_numeric(p, e) {
+        match l {
+            Lang::Py => format!("_fmt({c}, {s})"),
+            Lang::Rs => format!("fmt_dec({c}, {s})"),
+        }
+    } else {
+        c
+    }
+}
+
+/// 式 → (コード, 小数桁)。数値は 10^桁 倍した整数。
+fn sx(p: &Program, e: &Expr, l: Lang) -> (String, u32) {
+    match e {
+        Expr::Num(n) => lit_num(n),
+        Expr::Str(s) => (format!("{s:?}"), 0),
+        Expr::Var(v) => {
+            let (b, _, _) = split_lv(v);
+            (format!("self.{}", canon(p, &b)), scale_of(p, &b))
+        }
+        Expr::Idx(v, i) => {
+            let (b, _, _) = split_lv(v);
+            let (ic, _) = sx(p, i, l);
+            let c = canon(p, &b);
+            (
+                match l {
+                    Lang::Py => format!("self.{c}[({ic}) - 1]"),
+                    Lang::Rs => format!("self.{c}[(({ic}) - 1) as usize]"),
+                },
+                scale_of(p, &b),
+            )
+        }
+        Expr::Neg(x) => {
+            let (c, s) = sx(p, x, l);
+            (format!("(-{c})"), s)
+        }
+        Expr::Func(n, args) => func(p, n, args, l),
+        Expr::Bin(op, a, b) => {
+            let (ca, sa) = sx(p, a, l);
+            let (cb, sb) = sx(p, b, l);
+            let both = is_numeric(p, a) && is_numeric(p, b);
+            match op {
+                '+' | '-' => {
+                    if !both || sa == sb {
+                        (format!("({ca} {op} {cb})"), sa.max(sb))
+                    } else {
+                        let s = sa.max(sb);
+                        (format!("({} {op} {})", rescale(&ca, sa, s, false, l), rescale(&cb, sb, s, false, l)), s)
+                    }
+                }
+                '*' => (format!("({ca} * {cb})"), sa + sb),
+                '/' => {
+                    if sa == 0 && sb == 0 {
+                        match l {
+                            Lang::Py => (format!("_tdiv({ca}, {cb})"), 0),
+                            Lang::Rs => (format!("({ca} / {cb})"), 0),
+                        }
+                    } else {
+                        let k = 4 + sb;
+                        match l {
+                            Lang::Py => (format!("_tdiv({ca} * {}, {cb})", p10(k)), sa + 4),
+                            Lang::Rs => (format!("({ca} * {} / {cb})", p10(k)), sa + 4),
+                        }
+                    }
+                }
+                _ => {
+                    let sc = match &**b {
+                        Expr::Num(n) if sa > 0 => sa * n.parse::<u32>().unwrap_or(1),
+                        _ => sa,
+                    };
+                    match l {
+                        Lang::Py => (format!("({ca} ** {cb})"), sc),
+                        Lang::Rs => (format!("({ca}).pow(({cb}) as u32)"), sc),
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn func(p: &Program, n: &str, args: &[Expr], l: Lang) -> (String, u32) {
+    let a: Vec<(String, u32)> = args.iter().map(|x| sx(p, x, l)).collect();
+    let a0 = a.first().cloned().unwrap_or(("0".into(), 0));
+    let list = a.iter().map(|x| x.0.clone()).collect::<Vec<_>>().join(", ");
+    let py = l == Lang::Py;
+    match n {
+        "LENGTH" => {
+            if let Some(Expr::Var(v) | Expr::Idx(v, _)) = args.first() {
+                let (b, _, _) = split_lv(v);
+                if let Some(x) = var_of(p, &b) {
+                    if x.width > 0 {
+                        return (x.width.to_string(), 0);
+                    }
+                }
+            }
+            (if py { format!("len(str({}))", a0.0) } else { format!("(format!(\"{{}}\", {}).len() as i64)", a0.0) }, 0)
+        }
+        "UPPER-CASE" => (if py { format!("str({}).upper()", a0.0) } else { format!("format!(\"{{}}\", {}).to_uppercase()", a0.0) }, 0),
+        "LOWER-CASE" => (if py { format!("str({}).lower()", a0.0) } else { format!("format!(\"{{}}\", {}).to_lowercase()", a0.0) }, 0),
+        "REVERSE" => (if py { format!("str({})[::-1]", a0.0) } else { format!("format!(\"{{}}\", {}).chars().rev().collect::<String>()", a0.0) }, 0),
+        "MAX" => (if py { format!("max({list})") } else { format!("*[{list}].iter().max().unwrap()") }, a0.1),
+        "MIN" => (if py { format!("min({list})") } else { format!("*[{list}].iter().min().unwrap()") }, a0.1),
+        "ABS" => (if py { format!("abs({})", a0.0) } else { format!("({}).abs()", a0.0) }, a0.1),
+        "MOD" => {
+            let b = a.get(1).map(|x| x.0.clone()).unwrap_or("1".into());
+            (if py { format!("(({}) % ({b}))", a0.0) } else { format!("({}).rem_euclid({b})", a0.0) }, 0)
+        }
+        "NUMVAL" => (if py { format!("_num({})", a0.0) } else { format!("format!(\"{{}}\", {}).trim().parse::<i64>().unwrap_or(0)", a0.0) }, 0),
+        _ => (a0.0, 0), // INTEGER ほか: 整数部のみ(引数をそのまま)
+    }
+}
+
+fn cond(p: &Program, c: &Cond, l: Lang) -> String {
+    match c {
+        Cond::Cmp(o, a, b) => {
+            let (ca, sa) = sx(p, a, l);
+            let (cb, sb) = sx(p, b, l);
+            if sa != sb && is_numeric(p, a) && is_numeric(p, b) {
+                let s = sa.max(sb);
+                format!("{} {o} {}", rescale(&ca, sa, s, false, l), rescale(&cb, sb, s, false, l))
+            } else {
+                format!("{ca} {o} {cb}")
+            }
+        }
+        Cond::And(a, b) => format!("({} {} {})", cond(p, a, l), if l == Lang::Py { "and" } else { "&&" }, cond(p, b, l)),
+        Cond::Or(a, b) => format!("({} {} {})", cond(p, a, l), if l == Lang::Py { "or" } else { "||" }, cond(p, b, l)),
+        Cond::Not(a) => format!("{}({})", if l == Lang::Py { "not " } else { "!" }, cond(p, a, l)),
+        Cond::Class(e, k) => {
+            let (c, _) = sx(p, e, l);
+            match (l, k.as_str()) {
+                (Lang::Py, "NUMERIC") => format!("str({c}).lstrip(\"-\").isdigit()"),
+                (Lang::Py, "ALPHABETIC-LOWER") => format!("str({c}).replace(\" \", \"\").islower()"),
+                (Lang::Py, "ALPHABETIC-UPPER") => format!("str({c}).replace(\" \", \"\").isupper()"),
+                (Lang::Py, _) => format!("str({c}).replace(\" \", \"\").isalpha()"),
+                (Lang::Rs, "NUMERIC") => format!("{{ let s = format!(\"{{}}\", {c}); !s.is_empty() && s.trim_start_matches('-').chars().all(|ch| ch.is_ascii_digit()) }}"),
+                (Lang::Rs, "ALPHABETIC-LOWER") => format!("format!(\"{{}}\", {c}).chars().all(|ch| ch.is_lowercase() || ch == ' ')"),
+                (Lang::Rs, "ALPHABETIC-UPPER") => format!("format!(\"{{}}\", {c}).chars().all(|ch| ch.is_uppercase() || ch == ' ')"),
+                (Lang::Rs, _) => format!("format!(\"{{}}\", {c}).chars().all(|ch| ch.is_alphabetic() || ch == ' ')"),
+            }
+        }
+    }
+}
+
+/// 代入先の左辺(添字つきなら配列要素)
+fn lv(p: &Program, t: &str, l: Lang) -> String {
+    let (b, sub, _) = split_lv(t);
+    let c = canon(p, &b);
+    match sub.and_then(|k| p.subs.get(k)) {
+        Some(ix) => {
+            let (ic, _) = sx(p, ix, l);
+            match l {
+                Lang::Py => format!("self.{c}[({ic}) - 1]"),
+                Lang::Rs => format!("self.{c}[(({ic}) - 1) as usize]"),
+            }
+        }
+        None => format!("self.{c}"),
+    }
+}
+
+/// e を代入先 t の型・桁へ合わせた右辺コード
+fn val_for(p: &Program, t: &str, e: &Expr, l: Lang) -> String {
+    let (b, _, rounded) = split_lv(t);
+    let (c, s) = sx(p, e, l);
+    let snum = is_numeric(p, e);
+    if is_num(p, &b) {
+        if snum {
+            rescale(&c, s, scale_of(p, &b), rounded, l)
+        } else {
+            match l {
+                Lang::Py => format!("_num({c})"),
+                Lang::Rs => format!("{c}.trim().parse::<i64>().unwrap_or(0)"),
+            }
+        }
+    } else {
+        let d = if snum && s > 0 { disp(p, e, l) } else { c };
+        match l {
+            Lang::Py => d,
+            Lang::Rs => format!("{d}.to_string()"),
+        }
+    }
+}
+
+/// 文字列値のコードを代入先 t の型へ合わせる
+fn str_for(p: &Program, t: &str, s: String, l: Lang) -> String {
+    let (b, _, _) = split_lv(t);
+    if is_num(p, &b) {
+        match l {
+            Lang::Py => format!("_num({s})"),
+            Lang::Rs => format!("{s}.trim().parse::<i64>().unwrap_or(0)"),
+        }
+    } else {
+        s
+    }
+}
+
+fn semi(l: Lang) -> &'static str {
+    if l == Lang::Rs {
+        ";"
+    } else {
+        ""
+    }
 }
 
 fn emit(p: &Program, ss: &[Stmt], l: Lang, ind: usize, o: &mut String) {
@@ -988,148 +2104,480 @@ fn emit(p: &Program, ss: &[Stmt], l: Lang, ind: usize, o: &mut String) {
         o.push_str(&format!("{pad}{}\n", if l == Lang::Py { "pass" } else { "" }));
         return;
     }
+    let py = l == Lang::Py;
     for s in ss {
         match s {
-            Stmt::Display(a) => match l {
-                Lang::Py => o.push_str(&format!("{pad}self.out.append(\"\".join(str(x) for x in [{}]))\n", a.iter().map(|e| expr(e, l)).collect::<Vec<_>>().join(", "))),
-                Lang::Rs => o.push_str(&format!("{pad}self.out += &format!(\"{}\\n\", {});\n", "{}".repeat(a.len()), a.iter().map(|e| expr(e, l)).collect::<Vec<_>>().join(", "))),
-            },
-            Stmt::Move(src, tg) => {
-                for t in tg {
-                    let e = expr(src, l);
-                    match l {
-                        Lang::Py => o.push_str(&format!("{pad}self.{t} = {e}\n")),
-                        Lang::Rs => {
-                            if is_num(p, t) {
-                                o.push_str(&format!("{pad}self.{t} = {e};\n"));
-                            } else {
-                                o.push_str(&format!("{pad}self.{t} = {e}.to_string();\n"));
-                            }
-                        }
-                    }
+            Stmt::Display(a) | Stmt::DisplayNoNl(a) => {
+                let nl = matches!(s, Stmt::Display(_));
+                let items: Vec<String> = a.iter().map(|e| disp(p, e, l)).collect();
+                match l {
+                    Lang::Py => o.push_str(&format!("{pad}self.out += \"\".join(str(x) for x in [{}]){}\n", items.join(", "), if nl { " + \"\\n\"" } else { "" })),
+                    Lang::Rs => o.push_str(&format!("{pad}self.out += &format!(\"{}{}\", {});\n", "{}".repeat(a.len()), if nl { "\\n" } else { "" }, items.join(", "))),
                 }
             }
-            Stmt::Assign(t, e) => o.push_str(&format!("{pad}self.{t} = {}{}\n", expr(e, l), if l == Lang::Rs { ";" } else { "" })),
-            Stmt::AddTo(t, e) => o.push_str(&format!("{pad}self.{t} += {}{}\n", expr(e, l), if l == Lang::Rs { ";" } else { "" })),
-            Stmt::SubFrom(t, e) => o.push_str(&format!("{pad}self.{t} -= {}{}\n", expr(e, l), if l == Lang::Rs { ";" } else { "" })),
-            Stmt::MulBy(t, e) => o.push_str(&format!("{pad}self.{t} *= {}{}\n", expr(e, l), if l == Lang::Rs { ";" } else { "" })),
+            Stmt::Accept(t) => {
+                let tg = lv(p, t, l);
+                let src = if py { "_accept()".to_string() } else { "read_line()".to_string() };
+                o.push_str(&format!("{pad}{tg} = {}{}\n", str_for(p, t, src, l), semi(l)));
+            }
+            Stmt::Move(src, tg) => {
+                for t in tg {
+                    o.push_str(&format!("{pad}{} = {}{}\n", lv(p, t, l), val_for(p, t, src, l), semi(l)));
+                }
+            }
+            Stmt::Assign(t, e) => o.push_str(&format!("{pad}{} = {}{}\n", lv(p, t, l), val_for(p, t, e, l), semi(l))),
+            Stmt::AddTo(t, e) | Stmt::SubFrom(t, e) => {
+                let op = if matches!(s, Stmt::AddTo(..)) { "+=" } else { "-=" };
+                o.push_str(&format!("{pad}{} {op} {}{}\n", lv(p, t, l), val_for(p, t, e, l), semi(l)));
+            }
+            Stmt::MulBy(t, e) => {
+                let (b, _, rounded) = split_lv(t);
+                let (c, sc) = sx(p, e, l);
+                let ts = scale_of(p, &b);
+                if ts == 0 && sc == 0 {
+                    o.push_str(&format!("{pad}{} *= {c}{}\n", lv(p, t, l), semi(l)));
+                } else {
+                    let tg = lv(p, t, l);
+                    o.push_str(&format!("{pad}{tg} = {}{}\n", rescale(&format!("({tg} * {c})"), ts + sc, ts, rounded, l), semi(l)));
+                }
+            }
             Stmt::If(Cond::Cmp(o1, Expr::Num(a), Expr::Num(b)), body, _) if o1 == "==" && a == "1" && b == "1" => {
-                // 複数代入先の束(ADD ... TO a b)
+                // 複数の文の束(ADD ... TO a b / GO TO ... DEPENDING など)
                 emit(p, body, l, ind, o);
             }
             Stmt::If(c, th, el) => {
                 match l {
-                    Lang::Py => o.push_str(&format!("{pad}if {}:\n", cond(c, l))),
-                    Lang::Rs => o.push_str(&format!("{pad}if {} {{\n", cond(c, l))),
+                    Lang::Py => o.push_str(&format!("{pad}if {}:\n", cond(p, c, l))),
+                    Lang::Rs => o.push_str(&format!("{pad}if {} {{\n", cond(p, c, l))),
                 }
                 emit(p, th, l, ind + 1, o);
                 if !el.is_empty() {
-                    o.push_str(&format!("{pad}{}\n", if l == Lang::Py { "else:" } else { "} else {" }));
+                    o.push_str(&format!("{pad}{}\n", if py { "else:" } else { "} else {" }));
                     emit(p, el, l, ind + 1, o);
                 }
                 if l == Lang::Rs {
                     o.push_str(&format!("{pad}}}\n"));
                 }
             }
-            Stmt::Perform(lp, body) => {
-                match (lp, l) {
-                    (Loop::Once, _) => emit(p, body, l, ind, o),
-                    (Loop::Times(n), Lang::Py) => {
-                        o.push_str(&format!("{pad}for _ in range({}):\n", expr(n, l)));
-                        emit(p, body, l, ind + 1, o);
+            Stmt::Perform(lp, body) => match (lp, l) {
+                (Loop::Once, _) => emit(p, body, l, ind, o),
+                (Loop::Times(n), Lang::Py) => {
+                    o.push_str(&format!("{pad}for _ in range({}):\n", sx(p, n, l).0));
+                    emit(p, body, l, ind + 1, o);
+                }
+                (Loop::Times(n), Lang::Rs) => {
+                    o.push_str(&format!("{pad}for _ in 0..({}) {{\n", sx(p, n, l).0));
+                    emit(p, body, l, ind + 1, o);
+                    o.push_str(&format!("{pad}}}\n"));
+                }
+                (Loop::Until(c), Lang::Py) => {
+                    o.push_str(&format!("{pad}while not ({}):\n", cond(p, c, l)));
+                    emit(p, body, l, ind + 1, o);
+                }
+                (Loop::Until(c), Lang::Rs) => {
+                    o.push_str(&format!("{pad}while !({}) {{\n", cond(p, c, l)));
+                    emit(p, body, l, ind + 1, o);
+                    o.push_str(&format!("{pad}}}\n"));
+                }
+                (Loop::Varying { var, from, by, until }, Lang::Py) => {
+                    o.push_str(&format!("{pad}{} = {}\n{pad}while not ({}):\n", lv(p, var, l), val_for(p, var, from, l), cond(p, until, l)));
+                    emit(p, body, l, ind + 1, o);
+                    o.push_str(&format!("{pad}    {} += {}\n", lv(p, var, l), val_for(p, var, by, l)));
+                }
+                (Loop::Varying { var, from, by, until }, Lang::Rs) => {
+                    o.push_str(&format!("{pad}{} = {};\n{pad}while !({}) {{\n", lv(p, var, l), val_for(p, var, from, l), cond(p, until, l)));
+                    emit(p, body, l, ind + 1, o);
+                    o.push_str(&format!("{pad}    {} += {};\n{pad}}}\n", lv(p, var, l), val_for(p, var, by, l)));
+                }
+            },
+            Stmt::Call(n) => match l {
+                Lang::Py => o.push_str(&format!("{pad}_r = self.p_{n}()\n{pad}if _r:\n{pad}    return _r\n")),
+                Lang::Rs => o.push_str(&format!("{pad}{{ let r = self.p_{n}(); if r != 0 {{ return r; }} }}\n")),
+            },
+            Stmt::Thru(a, b) => {
+                let ia = p.paragraphs.iter().position(|x| &x.0 == a);
+                let ib = p.paragraphs.iter().position(|x| &x.0 == b);
+                match (ia, ib) {
+                    (Some(x), Some(y)) if x <= y => {
+                        let calls: Vec<Stmt> = p.paragraphs[x..=y].iter().map(|q| Stmt::Call(q.0.clone())).collect();
+                        emit(p, &calls, l, ind, o);
                     }
-                    (Loop::Times(n), Lang::Rs) => {
-                        o.push_str(&format!("{pad}for _ in 0..({}) {{\n", expr(n, l)));
-                        emit(p, body, l, ind + 1, o);
-                        o.push_str(&format!("{pad}}}\n"));
-                    }
-                    (Loop::Until(c), Lang::Py) => {
-                        o.push_str(&format!("{pad}while not ({}):\n", cond(c, l)));
-                        emit(p, body, l, ind + 1, o);
-                    }
-                    (Loop::Until(c), Lang::Rs) => {
-                        o.push_str(&format!("{pad}while !({}) {{\n", cond(c, l)));
-                        emit(p, body, l, ind + 1, o);
-                        o.push_str(&format!("{pad}}}\n"));
-                    }
-                    (Loop::Varying { var, from, by, until }, Lang::Py) => {
-                        o.push_str(&format!("{pad}self.{var} = {}\n{pad}while not ({}):\n", expr(from, l), cond(until, l)));
-                        emit(p, body, l, ind + 1, o);
-                        o.push_str(&format!("{pad}    self.{var} += {}\n", expr(by, l)));
-                    }
-                    (Loop::Varying { var, from, by, until }, Lang::Rs) => {
-                        o.push_str(&format!("{pad}self.{var} = {};\n{pad}while !({}) {{\n", expr(from, l), cond(until, l)));
-                        emit(p, body, l, ind + 1, o);
-                        o.push_str(&format!("{pad}    self.{var} += {};\n{pad}}}\n", expr(by, l)));
+                    _ => o.push_str(&format!("{pad}{} TODO(COBOL_to): PERFORM {a} THRU {b}: 段落が見つからない/順序が逆\n", if py { "#" } else { "//" })),
+                }
+            }
+            Stmt::Goto(n) => match l {
+                Lang::Py => o.push_str(&format!("{pad}self.goto = {n:?}\n{pad}return 2\n")),
+                Lang::Rs => o.push_str(&format!("{pad}self.goto = {n:?}.to_string();\n{pad}return 2;\n")),
+            },
+            Stmt::Initialize(names) => {
+                for n in names {
+                    let (b, _, _) = split_lv(n);
+                    match var_of(p, &b) {
+                        Some(v) => {
+                            let z = if v.numeric { Expr::Num("0".into()) } else { Expr::Str(String::new()) };
+                            emit(p, &[Stmt::Move(z, vec![n.clone()])], l, ind, o);
+                        }
+                        None => o.push_str(&format!("{pad}{} TODO(COBOL_to): INITIALIZE {b}: 群項目は未対応\n", if py { "#" } else { "//" })),
                     }
                 }
             }
-            Stmt::Call(n) => match l {
-                Lang::Py => o.push_str(&format!("{pad}self.p_{n}()\n")),
-                Lang::Rs => o.push_str(&format!("{pad}if self.p_{n}() {{ return true; }}\n")),
+            Stmt::Str(srcs, tg) => {
+                let items: Vec<String> = srcs
+                    .iter()
+                    .map(|(e, d)| match (d, l) {
+                        (None, Lang::Py) => format!("str({})", disp(p, e, l)),
+                        (None, Lang::Rs) => format!("format!(\"{{}}\", {})", disp(p, e, l)),
+                        (Some(d), Lang::Py) => format!("_upto(str({}), str({}))", disp(p, e, l), sx(p, d, l).0),
+                        (Some(d), Lang::Rs) => format!("upto(&format!(\"{{}}\", {}), &format!(\"{{}}\", {}))", disp(p, e, l), sx(p, d, l).0),
+                    })
+                    .collect();
+                let joined = if py { format!("\"\".join([{}])", items.join(", ")) } else { format!("[{}].concat()", items.join(", ")) };
+                o.push_str(&format!("{pad}{} = {}{}\n", lv(p, tg, l), str_for(p, tg, joined, l), semi(l)));
+            }
+            Stmt::Unstring(src, d, all, tgs) => {
+                let (cs, _) = sx(p, src, l);
+                let (cd, _) = sx(p, d, l);
+                match l {
+                    Lang::Py => {
+                        o.push_str(&format!("{pad}_u = str({cs}).split(str({cd}))\n"));
+                        if *all {
+                            o.push_str(&format!("{pad}_u = [x for x in _u if x]\n"));
+                        }
+                        for (k, t) in tgs.iter().enumerate() {
+                            o.push_str(&format!("{pad}if len(_u) > {k}:\n{pad}    {} = {}\n", lv(p, t, l), str_for(p, t, format!("_u[{k}]"), l)));
+                        }
+                    }
+                    Lang::Rs => {
+                        o.push_str(&format!("{pad}{{\n{pad}    let ss = format!(\"{{}}\", {cs});\n{pad}    let dd = format!(\"{{}}\", {cd});\n"));
+                        o.push_str(&format!("{pad}    let u: Vec<String> = ss.split(dd.as_str()).filter(|x| {}).map(|x| x.to_string()).collect();\n", if *all { "!x.is_empty()" } else { "true" }));
+                        for (k, t) in tgs.iter().enumerate() {
+                            o.push_str(&format!("{pad}    if u.len() > {k} {{ {} = {}; }}\n", lv(p, t, l), str_for(p, t, format!("u[{k}].clone()"), l)));
+                        }
+                        o.push_str(&format!("{pad}}}\n"));
+                    }
+                }
+            }
+            Stmt::Inspect(tg, op) => {
+                let t = format!("self.{}", canon(p, tg));
+                let s = |e: &Expr| sx(p, e, l).0;
+                match (op, l) {
+                    (Inspect::Tally(c, pat), Lang::Py) => o.push_str(&format!("{pad}self.{} += str({t}).count(str({}))\n", canon(p, c), s(pat))),
+                    (Inspect::Tally(c, pat), Lang::Rs) => o.push_str(&format!("{pad}self.{} += format!(\"{{}}\", {t}).matches(format!(\"{{}}\", {}).as_str()).count() as i64;\n", canon(p, c), s(pat))),
+                    (Inspect::Replace { first, from, to }, Lang::Py) => o.push_str(&format!("{pad}{t} = str({t}).replace(str({}), str({}){})\n", s(from), s(to), if *first { ", 1" } else { "" })),
+                    (Inspect::Replace { first, from, to }, Lang::Rs) => o.push_str(&format!(
+                        "{pad}{t} = {t}.{}(format!(\"{{}}\", {}).as_str(), format!(\"{{}}\", {}).as_str(){});\n",
+                        if *first { "replacen" } else { "replace" },
+                        s(from),
+                        s(to),
+                        if *first { ", 1" } else { "" }
+                    )),
+                    (Inspect::Convert(a, b), Lang::Py) => o.push_str(&format!("{pad}{t} = str({t}).translate(str.maketrans(str({}), str({})))\n", s(a), s(b))),
+                    (Inspect::Convert(a, b), Lang::Rs) => o.push_str(&format!(
+                        "{pad}{{ let a: Vec<char> = format!(\"{{}}\", {}).chars().collect(); let b: Vec<char> = format!(\"{{}}\", {}).chars().collect(); {t} = {t}.chars().map(|c| match a.iter().position(|x| *x == c) {{ Some(i) => b.get(i).copied().unwrap_or(c), None => c }}).collect(); }}\n",
+                        s(a),
+                        s(b)
+                    )),
+                }
+            }
+            Stmt::CallExt(name, args) => match l {
+                Lang::Py => o.push_str(&format!("{pad}self.call_ext({name:?}, [{}])\n", args.iter().map(|e| disp(p, e, l)).collect::<Vec<_>>().join(", "))),
+                Lang::Rs => o.push_str(&format!(
+                    "{pad}match self.ext {{ Some(f) => f({name:?}, vec![{}]), None => panic!(\"COBOL_to: CALL {name} は未登録(run_with で登録する)\") }}\n",
+                    args.iter().map(|e| format!("format!(\"{{}}\", {})", disp(p, e, l))).collect::<Vec<_>>().join(", ")
+                )),
             },
+            Stmt::Open(f, mode) => match l {
+                Lang::Py => o.push_str(&format!("{pad}self.f_open({f:?}, {mode:?})\n")),
+                Lang::Rs => o.push_str(&format!("{pad}self.fo_{f}({mode:?});\n")),
+            },
+            Stmt::Close(f) => match l {
+                Lang::Py => o.push_str(&format!("{pad}self.f_close({f:?})\n")),
+                Lang::Rs => o.push_str(&format!("{pad}self.fc_{f}();\n")),
+            },
+            Stmt::Read(f, into, at_end, not_at_end) => {
+                let mut ok: Vec<Stmt> = vec![];
+                if let Some(i) = into {
+                    match p.files.iter().find(|x| &x.name == f) {
+                        Some(fd) if fd.fields.len() == 1 => ok.push(Stmt::Move(Expr::Var(fd.fields[0].clone()), vec![i.clone()])),
+                        _ => ok.push(Stmt::Todo("READ INTO: 複数項目のレコードは未対応".into())),
+                    }
+                }
+                ok.extend(not_at_end.iter().cloned());
+                match l {
+                    Lang::Py => {
+                        o.push_str(&format!("{pad}if self.f_read({f:?}):\n"));
+                        emit(p, &ok, l, ind + 1, o);
+                        if !at_end.is_empty() {
+                            o.push_str(&format!("{pad}else:\n"));
+                            emit(p, at_end, l, ind + 1, o);
+                        }
+                    }
+                    Lang::Rs => {
+                        o.push_str(&format!("{pad}if self.rd_{f}() {{\n"));
+                        emit(p, &ok, l, ind + 1, o);
+                        o.push_str(&format!("{pad}}} else {{\n"));
+                        emit(p, at_end, l, ind + 1, o);
+                        o.push_str(&format!("{pad}}}\n"));
+                    }
+                }
+            }
+            Stmt::Write(f, from) => {
+                if let Some(e) = from {
+                    match p.files.iter().find(|x| &x.name == f) {
+                        Some(fd) if fd.fields.len() == 1 => emit(p, &[Stmt::Move(e.clone(), vec![fd.fields[0].clone()])], l, ind, o),
+                        _ => o.push_str(&format!("{pad}{} TODO(COBOL_to): WRITE FROM: 複数項目のレコードは未対応\n", if py { "#" } else { "//" })),
+                    }
+                }
+                match l {
+                    Lang::Py => o.push_str(&format!("{pad}self.f_write({f:?})\n")),
+                    Lang::Rs => o.push_str(&format!("{pad}self.wr_{f}();\n")),
+                }
+            }
             Stmt::Stop => o.push_str(&match l {
-                Lang::Py => format!("{pad}raise _Stop()\n"),
-                Lang::Rs => format!("{pad}return true;\n"),
+                Lang::Py => format!("{pad}return 1\n"),
+                Lang::Rs => format!("{pad}return 1;\n"),
             }),
             Stmt::Nop => {}
-            Stmt::Todo(t) => o.push_str(&format!("{pad}{} TODO(COBOL_to): 未対応の文 {t}\n", if l == Lang::Py { "#" } else { "//" })),
+            Stmt::Todo(t) => o.push_str(&format!("{pad}{} TODO(COBOL_to): 未対応の文 {t}\n", if py { "#" } else { "//" })),
         }
     }
 }
 
 fn init_value(v: &Var) -> String {
-    if v.init.is_empty() {
-        if v.numeric { "0".into() } else { "\"\"".into() }
+    let base = if v.numeric {
+        if v.init.is_empty() {
+            "0".to_string()
+        } else {
+            let (code, s) = lit_num(&v.init);
+            let n: i64 = code.parse().unwrap_or(0);
+            if s <= v.scale {
+                (n * 10i64.pow(v.scale - s)).to_string()
+            } else {
+                (n / 10i64.pow(s - v.scale)).to_string()
+            }
+        }
+    } else if v.init.is_empty() {
+        "\"\"".to_string()
+    } else if v.init.starts_with('\'') {
+        format!("{:?}", &v.init[1..v.init.len().saturating_sub(1)])
     } else {
         v.init.clone()
-    }
+    };
+    base
+}
+
+fn note_lines(p: &Program, c: &str) -> String {
+    p.notes.iter().map(|n| format!("{c} TODO(COBOL_to): {n}\n")).collect()
+}
+
+fn order(p: &Program) -> Vec<String> {
+    let mut v = vec!["_entry".to_string()];
+    v.extend(p.paragraphs.iter().map(|x| x.0.clone()));
+    v
 }
 
 pub fn to_python(p: &Program) -> String {
-    let mut o = String::from("# COBOL_to generated(数値は整数として扱う。/ は切り捨て除算 //)\nclass _Stop(Exception):\n    pass\n\n\nclass State:\n    def __init__(self):\n        self.out = []\n");
+    let mut o = String::from("# COBOL_to generated(数値は 10^小数桁 倍した整数。割り算は 0 方向への切り捨て)\nimport os\n");
+    o += &note_lines(p, "#");
+    o += "\nEXTERNAL = {}  # CALL \"NAME\" の呼び先: EXTERNAL[\"NAME\"] = callable(*args)\n\n\n";
+    o += "def _tdiv(a, b):\n    q = abs(a) // abs(b)\n    return q if (a < 0) == (b < 0) else -q\n\n\n";
+    o += "def _rdiv(a, b):\n    q = (abs(a) * 2 + abs(b)) // (abs(b) * 2)\n    return q if (a < 0) == (b < 0) else -q\n\n\n";
+    o += "def _fmt(v, s):\n    d = str(abs(v)).rjust(s + 1, \"0\")\n    return (\"-\" if v < 0 else \"\") + d[:-s] + \".\" + d[-s:]\n\n\n";
+    o += "def _num(x):\n    try:\n        return int(str(x).strip())\n    except ValueError:\n        return 0\n\n\n";
+    o += "def _accept():\n    try:\n        return input()\n    except EOFError:\n        return \"\"\n\n\n";
+    o += "def _upto(s, d):\n    return s.split(d)[0] if d else s\n\n\n";
+    if !p.files.is_empty() {
+        o += "_FILES = {\n";
+        for f in &p.files {
+            let path = if f.assign_lit { format!("{:?}", f.assign) } else { format!("os.environ.get({:?}, {:?})", f.assign.to_uppercase(), f.assign.to_lowercase()) };
+            let fields: Vec<String> = f
+                .fields
+                .iter()
+                .map(|n| {
+                    let v = var_of(p, n);
+                    format!("({:?}, {}, {})", n, v.map(|x| x.width.max(1)).unwrap_or(1), if v.map(|x| x.numeric).unwrap_or(false) { "True" } else { "False" })
+                })
+                .collect();
+            o += &format!("    {:?}: {{\"path\": {path}, \"status\": {}, \"fields\": [{}]}},\n", f.name, f.status.as_ref().map(|s| format!("{s:?}")).unwrap_or("None".into()), fields.join(", "));
+        }
+        o += "}\n\n\n";
+    }
+    o += "class State:\n    def __init__(self):\n        self.out = \"\"\n        self.goto = \"\"\n        self._fh = {}\n";
     for v in &p.vars {
-        o += &format!("        self.{} = {}{}\n", ident(&v.name), init_value(v), if v.decimal { "  # TODO(COBOL_to): 小数 PIC を整数として扱っている" } else if v.undeclared { "  # TODO(COBOL_to): 宣言が見つからない変数" } else { "" });
+        let init = init_value(v);
+        let val = if v.occurs > 0 { format!("[{init}] * {}", v.occurs) } else { init };
+        o += &format!("        self.{} = {val}{}\n", ident(&v.name), if v.undeclared { "  # TODO(COBOL_to): 宣言が見つからない変数" } else { "" });
     }
-    o += "\n    def main(self):\n";
-    let mut body = String::new();
-    emit(p, &p.stmts, Lang::Py, 2, &mut body);
-    o += &body;
-    for (n, _) in &p.paragraphs {
-        o += &format!("        self.p_{n}()\n");
+    o += "\n    def call_ext(self, name, args):\n        f = EXTERNAL.get(name)\n        if f is None:\n            raise NotImplementedError(\"COBOL_to: CALL \" + name + \" は EXTERNAL に登録されていない\")\n        return f(*args)\n";
+    if !p.files.is_empty() {
+        o += "\n    def _fs(self, name, code):\n        st = _FILES[name][\"status\"]\n        if st:\n            setattr(self, st, int(code) if isinstance(getattr(self, st), int) else code)\n";
+        o += "\n    def f_open(self, name, mode):\n        try:\n            self._fh[name] = open(_FILES[name][\"path\"], {\"input\": \"r\", \"output\": \"w\", \"extend\": \"a\", \"io\": \"r\"}[mode], encoding=\"utf-8\", newline=\"\")\n            self._fs(name, \"00\")\n        except OSError:\n            self._fs(name, \"35\")\n";
+        o += "\n    def f_close(self, name):\n        fh = self._fh.pop(name, None)\n        if fh:\n            fh.close()\n";
+        o += "\n    def f_read(self, name):\n        fh = self._fh.get(name)\n        line = fh.readline() if fh else \"\"\n        if not line:\n            self._fs(name, \"10\")\n            return False\n        line = line.rstrip(\"\\r\\n\")\n        pos = 0\n        for attr, w, num in _FILES[name][\"fields\"]:\n            seg = line[pos:pos + w]\n            pos += w\n            setattr(self, attr, _num(seg) if num else seg.rstrip())\n        self._fs(name, \"00\")\n        return True\n";
+        o += "\n    def f_write(self, name):\n        fh = self._fh.get(name)\n        buf = \"\"\n        for attr, w, num in _FILES[name][\"fields\"]:\n            v = getattr(self, attr)\n            if num:\n                buf += (\"-\" + str(-v).rjust(w - 1, \"0\")) if v < 0 else str(v).rjust(w, \"0\")\n            else:\n                buf += str(v)[:w].ljust(w)\n        if fh:\n            fh.write(buf + \"\\n\")\n            self._fs(name, \"00\")\n";
     }
-    if p.stmts.is_empty() && p.paragraphs.is_empty() {
-        o += "        pass\n";
-    }
+    let ord = order(p);
+    o += &format!("\n    def main(self):\n        order = [{}]\n        i = 0\n        while i < len(order):\n            r = getattr(self, \"p_\" + order[i])()\n            if r == 1:\n                return 1\n            if r == 2:\n                if self.goto not in order:\n                    return 2\n                i = order.index(self.goto)\n                continue\n            i += 1\n        return 0\n", ord.iter().map(|x| format!("{x:?}")).collect::<Vec<_>>().join(", "));
+    o += "\n    def p__entry(self):\n";
+    emit(p, &p.stmts, Lang::Py, 2, &mut o);
+    o += "        return 0\n";
     for (n, ss) in &p.paragraphs {
         o += &format!("\n    def p_{n}(self):\n");
         emit(p, ss, Lang::Py, 2, &mut o);
+        o += "        return 0\n";
     }
-    o + "\n\ndef run() -> str:\n    s = State()\n    try:\n        s.main()\n    except _Stop:\n        pass\n    return \"\\n\".join(s.out) + \"\\n\"\n"
+    o + "\n\ndef run() -> str:\n    s = State()\n    s.main()\n    for f in list(s._fh.values()):\n        f.close()\n    return s.out\n"
 }
 
 pub fn to_rust(p: &Program) -> String {
-    let mut o = String::from("// COBOL_to generated. 数値は i64、文字は String。\n#![allow(unreachable_code, unused_parens, unused_assignments, unused_mut, unused_variables, dead_code)]\npub struct State {\n    out: String,\n");
+    let mut o = String::from("// COBOL_to generated. 数値は i64(10^小数桁 倍した整数)、文字は String。\n#![allow(unreachable_code, unused_parens, unused_assignments, unused_mut, unused_variables, dead_code)]\n");
+    o += &note_lines(p, "//");
+    o += "\n/// CALL \"NAME\" の呼び先(引数は文字列化して渡す)\npub type Ext = fn(&str, Vec<String>);\n\n";
+    o += "fn rdiv(a: i64, b: i64) -> i64 {\n    let q = (a.abs() * 2 + b.abs()) / (b.abs() * 2);\n    if (a < 0) == (b < 0) { q } else { -q }\n}\n\n";
+    o += "fn fmt_dec(v: i64, s: u32) -> String {\n    let d = format!(\"{:0>w$}\", v.abs(), w = s as usize + 1);\n    let k = d.len() - s as usize;\n    format!(\"{}{}.{}\", if v < 0 { \"-\" } else { \"\" }, &d[..k], &d[k..])\n}\n\n";
+    o += "fn pad_num(v: i64, w: usize) -> String {\n    if v < 0 { format!(\"-{:0>w$}\", -v, w = w.saturating_sub(1)) } else { format!(\"{:0>w$}\", v, w = w) }\n}\n\n";
+    o += "fn pad_str(s: &str, w: usize) -> String {\n    let t: String = s.chars().take(w).collect();\n    format!(\"{:<w$}\", t, w = w)\n}\n\n";
+    o += "fn upto(s: &str, d: &str) -> String {\n    if d.is_empty() { s.to_string() } else { s.split(d).next().unwrap_or(\"\").to_string() }\n}\n\n";
+    o += "fn read_line() -> String {\n    let mut s = String::new();\n    let _ = std::io::stdin().read_line(&mut s);\n    s.trim_end_matches(['\\r', '\\n']).to_string()\n}\n\n";
+    o += "pub struct State {\n    out: String,\n    goto: String,\n    ext: Option<Ext>,\n";
     for v in &p.vars {
-        o += &format!("    {}: {},\n", ident(&v.name), if v.numeric { "i64" } else { "String" });
+        let t = if v.numeric { "i64" } else { "String" };
+        o += &format!("    {}: {},\n", ident(&v.name), if v.occurs > 0 { format!("Vec<{t}>") } else { t.to_string() });
     }
-    o += "}\n\nimpl State {\n    fn new() -> Self {\n        State {\n            out: String::new(),\n";
+    for f in &p.files {
+        o += &format!("    fr_{0}: Option<std::io::BufReader<std::fs::File>>,\n    fw_{0}: Option<std::fs::File>,\n", f.name);
+    }
+    o += "}\n\nimpl State {\n    fn new(ext: Option<Ext>) -> Self {\n        State {\n            out: String::new(),\n            goto: String::new(),\n            ext,\n";
     for v in &p.vars {
         let init = init_value(v);
-        o += &format!("            {}: {}, {}\n", ident(&v.name), if v.numeric { init } else { format!("{init}.to_string()") }, if v.decimal { "// TODO(COBOL_to): 小数 PIC を整数として扱っている" } else if v.undeclared { "// TODO(COBOL_to): 宣言が見つからない変数" } else { "" });
+        let one = if v.numeric { init } else { format!("{init}.to_string()") };
+        let val = if v.occurs > 0 { format!("vec![{one}; {}]", v.occurs) } else { one };
+        o += &format!("            {}: {val}, {}\n", ident(&v.name), if v.undeclared { "// TODO(COBOL_to): 宣言が見つからない変数" } else { "" });
     }
-    o += "        }\n    }\n\n    fn main(&mut self) -> bool {\n";
+    for f in &p.files {
+        o += &format!("            fr_{0}: None,\n            fw_{0}: None,\n", f.name);
+    }
+    o += "        }\n    }\n";
+    let ord = order(p);
+    o += "\n    fn main(&mut self) -> u8 {\n";
+    o += &format!("        let order: &[&str] = &[{}];\n", ord.iter().map(|x| format!("{x:?}")).collect::<Vec<_>>().join(", "));
+    o += "        let mut i = 0usize;\n        while i < order.len() {\n            let r = match order[i] {\n";
+    for n in &ord {
+        o += &format!("                {n:?} => self.p_{n}(),\n");
+    }
+    o += "                _ => 0,\n            };\n            if r == 1 {\n                return 1;\n            }\n            if r == 2 {\n                let g = self.goto.clone();\n                match order.iter().position(|x| *x == g) {\n                    Some(k) => {\n                        i = k;\n                        continue;\n                    }\n                    None => return 2,\n                }\n            }\n            i += 1;\n        }\n        0\n    }\n";
+    o += "\n    fn p__entry(&mut self) -> u8 {\n";
     emit(p, &p.stmts, Lang::Rs, 2, &mut o);
-    for (n, _) in &p.paragraphs {
-        o += &format!("        if self.p_{n}() {{ return true; }}\n");
-    }
-    o += "        false\n    }\n";
+    o += "        0\n    }\n";
     for (n, ss) in &p.paragraphs {
-        o += &format!("\n    fn p_{n}(&mut self) -> bool {{\n");
+        o += &format!("\n    fn p_{n}(&mut self) -> u8 {{\n");
         emit(p, ss, Lang::Rs, 2, &mut o);
-        o += "        false\n    }\n";
+        o += "        0\n    }\n";
     }
-    o + "}\n\npub fn run() -> String {\n    let mut s = State::new();\n    s.main();\n    s.out\n}\n"
+    for f in &p.files {
+        let n = &f.name;
+        // 状態コード
+        o += &format!("\n    fn fs_{n}(&mut self, code: &str) {{\n");
+        match f.status.as_ref().map(|s| (s.clone(), var_of(p, s).map(|v| v.numeric).unwrap_or(false))) {
+            Some((s, true)) => o += &format!("        self.{s} = code.parse().unwrap_or(0);\n"),
+            Some((s, false)) => o += &format!("        self.{s} = code.to_string();\n"),
+            None => o += "        let _ = code;\n",
+        }
+        o += "    }\n";
+        let path = if f.assign_lit { format!("{:?}.to_string()", f.assign) } else { format!("std::env::var({:?}).unwrap_or_else(|_| {:?}.to_string())", f.assign.to_uppercase(), f.assign.to_lowercase()) };
+        o += &format!("\n    fn fo_{n}(&mut self, mode: &str) {{\n        let path = {path};\n        if mode == \"input\" || mode == \"io\" {{\n            match std::fs::File::open(&path) {{\n                Ok(f) => {{ self.fr_{n} = Some(std::io::BufReader::new(f)); self.fs_{n}(\"00\"); }}\n                Err(_) => self.fs_{n}(\"35\"),\n            }}\n        }} else {{\n            match std::fs::OpenOptions::new().write(true).create(true).truncate(mode == \"output\").append(mode == \"extend\").open(&path) {{\n                Ok(f) => {{ self.fw_{n} = Some(f); self.fs_{n}(\"00\"); }}\n                Err(_) => self.fs_{n}(\"35\"),\n            }}\n        }}\n    }}\n");
+        o += &format!("\n    fn fc_{n}(&mut self) {{\n        self.fr_{n} = None;\n        self.fw_{n} = None;\n    }}\n");
+        o += &format!("\n    fn rd_{n}(&mut self) -> bool {{\n        use std::io::BufRead;\n        let mut line = String::new();\n        let got = match self.fr_{n}.as_mut() {{ Some(r) => r.read_line(&mut line).unwrap_or(0), None => 0 }};\n        if got == 0 {{\n            self.fs_{n}(\"10\");\n            return false;\n        }}\n        let chars: Vec<char> = line.trim_end_matches(['\\r', '\\n']).chars().collect();\n        let mut pos = 0usize;\n");
+        for fld in &f.fields {
+            let v = var_of(p, fld);
+            let w = v.map(|x| x.width.max(1)).unwrap_or(1);
+            let num = v.map(|x| x.numeric).unwrap_or(false);
+            o += &format!("        {{\n            let seg: String = chars.iter().skip(pos).take({w}).collect();\n            pos += {w};\n            self.{fld} = {};\n        }}\n", if num { "seg.trim().parse::<i64>().unwrap_or(0)" } else { "seg.trim_end().to_string()" });
+        }
+        o += &format!("        self.fs_{n}(\"00\");\n        true\n    }}\n");
+        o += &format!("\n    fn wr_{n}(&mut self) {{\n        use std::io::Write;\n        let mut s = String::new();\n");
+        for fld in &f.fields {
+            let v = var_of(p, fld);
+            let w = v.map(|x| x.width.max(1)).unwrap_or(1);
+            let num = v.map(|x| x.numeric).unwrap_or(false);
+            o += &format!("        s += &{};\n", if num { format!("pad_num(self.{fld}, {w})") } else { format!("pad_str(&self.{fld}, {w})") });
+        }
+        o += &format!("        s.push('\\n');\n        if let Some(w) = self.fw_{n}.as_mut() {{\n            let _ = w.write_all(s.as_bytes());\n        }}\n        self.fs_{n}(\"00\");\n    }}\n");
+    }
+    o + "}\n\npub fn run() -> String {\n    run_with(None)\n}\n\npub fn run_with(ext: Option<Ext>) -> String {\n    let mut s = State::new(ext);\n    s.main();\n    s.out\n}\n"
+}
+
+
+// ---------------- COPY 展開 ----------------
+
+/// `COPY name [REPLACING ==a== BY ==b== ...].` をコピー句の内容で置き換える(解析の前に呼ぶ)。
+/// 探す場所は dirs(拡張子なし・.cpy・.cbl・.cob・.copy、大文字小文字は両方)。見つからない行はそのまま残す
+/// (解析側が `TODO(COBOL_to)` として表示する)。
+pub fn expand_copy(src: &str, free: bool, dirs: &[std::path::PathBuf]) -> String {
+    expand_rec(src, free, dirs, 0)
+}
+
+fn expand_rec(src: &str, free: bool, dirs: &[std::path::PathBuf], depth: usize) -> String {
+    if depth > 8 {
+        return src.to_string();
+    }
+    let mut out = String::new();
+    for line in src.lines() {
+        let code: String = if free {
+            line.trim_start().to_string()
+        } else {
+            let c: Vec<char> = line.chars().collect();
+            if c.len() <= 7 || c[6] == '*' || c[6] == '/' {
+                String::new()
+            } else {
+                c[7..c.len().min(72)].iter().collect::<String>().trim_start().to_string()
+            }
+        };
+        let up = code.to_uppercase();
+        if up.starts_with("COPY ") {
+            let toks: Vec<&str> = code.split_whitespace().collect();
+            let name = toks.get(1).map(|t| t.trim_end_matches('.').trim_matches(|c| c == '"' || c == '\'')).unwrap_or("");
+            // REPLACING ==a== BY ==b==
+            let mut reps: Vec<(String, String)> = vec![];
+            if let Some(pos) = up.find("REPLACING") {
+                let rest = code[pos + "REPLACING".len()..].trim_end().trim_end_matches('.');
+                let parts: Vec<&str> = rest.split("==").collect();
+                // parts: ["", a, " BY ", b, ""...]
+                let mut k = 1;
+                while k + 2 < parts.len() {
+                    reps.push((parts[k].to_string(), parts[k + 2].to_string()));
+                    k += 4;
+                }
+            }
+            let mut found: Option<String> = None;
+            'outer: for d in dirs {
+                for nm in [name.to_string(), name.to_lowercase(), name.to_uppercase()] {
+                    for ext in ["", ".cpy", ".CPY", ".cbl", ".CBL", ".cob", ".COB", ".copy", ".COPY"] {
+                        let path = d.join(format!("{nm}{ext}"));
+                        if path.is_file() {
+                            if let Ok(b) = std::fs::read(&path) {
+                                found = Some(String::from_utf8_lossy(&b).into_owned());
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(mut text) = found {
+                for (a, b) in &reps {
+                    text = text.replace(a.trim(), b.trim());
+                }
+                out.push_str(&expand_rec(&text, free, dirs, depth + 1));
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                continue;
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1158,7 +2606,7 @@ mod tests {
         assert!(py.contains("for _ in range(2):"), "{py}");
         let rs = to_rust(&p);
         assert!(rs.contains("while !(self.i > 5) {"), "{rs}");
-        assert!(rs.contains("fn p_show(&mut self) -> bool"), "{rs}");
+        assert!(rs.contains("fn p_show(&mut self) -> u8"), "{rs}");
     }
     #[test]
     fn evaluate_arms() {
@@ -1176,6 +2624,63 @@ mod tests {
 ";
         let py = to_python(&parse(src, false));
         assert!(py.contains("if self.n == 1:") && py.contains("elif") == false && py.contains("self.n == 3"), "{py}");
+    }
+    fn todo_free(src: &str) -> Program {
+        let p = parse(src, false);
+        let py = to_python(&p);
+        assert!(!py.contains("未対応の文"), "{py}");
+        p
+    }
+    #[test]
+    fn continuation_line_pads_literal() {
+        let src = "       PROGRAM-ID. C.\n       DATA DIVISION.\n       WORKING-STORAGE SECTION.\n       01 X PIC X(80) VALUE \"ABC\n      -    \"DEF\".\n";
+        let p = parse(src, false);
+        assert_eq!(p.vars[0].init, format!("\"ABC{}DEF\"", " ".repeat(40)), "{:?}", p.vars[0].init);
+    }
+    #[test]
+    fn decimals_are_scaled() {
+        let src = "       PROGRAM-ID. D.\n       DATA DIVISION.\n       WORKING-STORAGE SECTION.\n       01 P PIC 9(3)V99 VALUE 12.5.\n       01 T PIC 9(5)V9.\n       PROCEDURE DIVISION.\n           COMPUTE T ROUNDED = P * 3.\n           DISPLAY T.\n           STOP RUN.\n";
+        let p = parse(src, false);
+        assert_eq!(p.vars[0].scale, 2);
+        assert_eq!(p.vars[0].width, 5);
+        let py = to_python(&p);
+        assert!(py.contains("self.p = 1250"), "{py}");
+        assert!(py.contains("_rdiv((self.p * 3), 10)") || py.contains("_rdiv("), "{py}");
+        assert!(py.contains("_fmt(self.t, 1)"), "{py}");
+        let rs = to_rust(&p);
+        assert!(rs.contains("rdiv("), "{rs}");
+    }
+    #[test]
+    fn occurs_goto_88_redefines_string() {
+        let src = "       PROGRAM-ID. O.\n       DATA DIVISION.\n       WORKING-STORAGE SECTION.\n       01 T PIC 9 OCCURS 3 TIMES.\n       01 I PIC 9 VALUE 1.\n       01 F PIC 9 VALUE 0.\n          88 ON1 VALUE 1.\n       01 A PIC 9(4).\n       01 B REDEFINES A PIC 9(4).\n       01 S PIC X(20).\n       PROCEDURE DIVISION.\n       M.\n           MOVE 5 TO T(I).\n           SET ON1 TO TRUE.\n           IF ON1 GO TO E.\n           STRING \"a\" DELIMITED BY SIZE \"b\" DELIMITED BY SIZE INTO S.\n       E.\n           STOP RUN.\n";
+        let p = todo_free(src);
+        assert!(p.alias.iter().any(|a| a.0 == "b" && a.1 == "a"), "{:?}", p.alias);
+        assert_eq!(p.vars.iter().filter(|v| v.name == "B").count(), 0);
+        let py = to_python(&p);
+        assert!(py.contains("self.t[(self.i) - 1] = 5"), "{py}");
+        assert!(py.contains("self.goto = \"e\""), "{py}");
+        assert!(py.contains("self.t = [0] * 3"), "{py}");
+    }
+    #[test]
+    fn file_io_definitions() {
+        let src = include_str!("../tests/samples/fileio.cbl");
+        let p = todo_free(src);
+        assert_eq!(p.files.len(), 2);
+        assert_eq!(p.files[0].fields, vec!["o_name", "o_amt"]);
+        assert_eq!(p.files[0].status.as_deref(), Some("fs"));
+        let rs = to_rust(&p);
+        assert!(rs.contains("fn rd_in_file(&mut self) -> bool"), "{rs}");
+    }
+    #[test]
+    fn copy_is_expanded() {
+        let dir = std::env::temp_dir().join("cobol_to_copy_test");
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("ITEMS.cpy"), "       01 PRICE PIC 9(3) VALUE 7.\n").unwrap();
+        let src = "       PROGRAM-ID. X.\n       DATA DIVISION.\n       WORKING-STORAGE SECTION.\n       COPY ITEMS.\n";
+        let out = expand_copy(src, false, &[dir.clone()]);
+        assert!(out.contains("01 PRICE PIC 9(3) VALUE 7."), "{out}");
+        assert_eq!(parse(&out, false).vars.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
     fn unsupported_stays_visible() {

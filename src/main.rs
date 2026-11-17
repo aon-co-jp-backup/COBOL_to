@@ -130,6 +130,14 @@ fn main() {
         };
         let d = detect::detect(&text);
         report += &format!("| {} | {} | {} | {} | {} |\n", rel.display(), d.dialect, d.standard, if d.free_format { "自由" } else { "固定" }, d.evidence.join("; "));
+        let mut dirs: Vec<PathBuf> = vec![];
+        if let Some(par) = e.path().parent() {
+            for sub in ["", "copy", "copybook", "COPY", "COPYBOOK", "cpy"] {
+                dirs.push(par.join(sub));
+            }
+        }
+        dirs.push(src.clone());
+        let text = convert::expand_copy(&text, d.free_format, &dirs);
         let prog = convert::parse(&text, d.free_format);
         let name: String = rel.with_extension("").to_string_lossy().chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).collect();
         let (code, ext, dir) = if target.is_python() { (convert::to_python(&prog), "py", "programs") } else { (convert::to_rust(&prog), "rs", "src/programs") };
