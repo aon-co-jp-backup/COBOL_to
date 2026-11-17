@@ -1,27 +1,72 @@
 # COBOL_to
 
-COBOL の方言・版・書式を自動判定し、Rust/RPoem/Python 系スタックへ変換するツール。/ Detects the COBOL dialect, standard and source format automatically and converts to Rust/RPoem/Python stacks.
+**日本語 → English**
 
-## 使い方 / Usage
+COBOL の方言・版・書式を**自動判定**し、選んだスタックのプロジェクトへ変換するツールです。
+*Detects the COBOL dialect, standard and source format automatically and converts to the stack you choose.*
+
+- リポジトリ / Repository: https://github.com/aon-co-jp/COBOL_to
+- ライセンス / License: MIT
+
+## 日本語
+
+### できること
+- **自動判定**: IBM Enterprise(メインフレーム)/ Micro Focus / GnuCOBOL / ACUCOBOL-GT / Fujitsu NetCOBOL / 日立 COBOL、規格は COBOL-68・74・85・2002/2014、書式は固定・自由。根拠つきで `COBOL_to-REPORT.md` に出力します。
+- **変換先を選択**(4種):
+  1. 最新 Python + 最新 FastAPI + Next.js/Node.js + HTML5/CSS3/TypeScript/Bootstrap
+  2. 最新 Python + 最新 MFastAPI + 同上
+  3. 最新 Rust + 最新 Poem
+  4. 最新 Rust + 最新 RPoem(Bootstrap・TypeScript・Next.js・Node.js は使わない。RPoem は Rust→WASM 方針)
+- **フォルダ選択**: 引数なしで起動すると、エクスプローラー(ファイル選択ダイアログ)が開き、プログラムや複数プロジェクトの上位フォルダを選べます。出力先は既存フォルダの選択も、新しい名前の入力(空欄は `<元>-converted`)もできます。
+- **API**: Connect 形式 `POST /cobol_to.Program/Run`(REST は使いません)。
+
+### 使い方
 ```
-cobol_to                                  # フォルダ選択ダイアログが開く / opens a folder picker
+cobol_to                                  # フォルダ選択ダイアログが開く
 cobol_to --src <dir> --target <fastapi|mfastapi|rust-poem|rpoem> --out <dir>
 ```
-- 判定: IBM Enterprise / Micro Focus / GnuCOBOL / ACUCOBOL / NetCOBOL / 日立、COBOL-68〜2014、固定/自由形式。結果は出力先の `COBOL_to-REPORT.md`。
-- API: Connect 形式 `POST /cobol_to.Program/Run`(REST は使わない)。
-- 変換できる構文は現状 `PROGRAM-ID`/`01・77`/`DISPLAY`/`MOVE`/`ADD`/`STOP RUN` のみ。未対応の文は `TODO(COBOL_to)` として出力。EBCDIC は未変換。
-- 更新通知: [NOTIFY.md](NOTIFY.md)(日英独露)。
 
-License: MIT
+### 現在の制限(正直な状態)
+- 変換できる構文は `PROGRAM-ID` / `01・77`(PIC, VALUE)/ `DISPLAY` / `MOVE` / `ADD` / `STOP RUN` のみ。`IF`・`PERFORM`・`COMPUTE`・ファイル I/O・`COPY` などは**黙って落とさず** `TODO(COBOL_to)` として出力します。
+- メインフレームの EBCDIC ファイルは変換せず、レポートに載せるだけです(UTF-8/ASCII へ変換してから実行)。
+- 生成物は「プログラムの登録表 + 雛形」までで、FastAPI/MFastAPI/RPoem 実サーバーへの接続、Next.js 画面の自動生成は未実装です。
+- 生成プロジェクトの依存は**固定しません**(最新版は version-control の通知に従う)。
 
-## インストーラー / Installers
-| OS | 形式 / Format | 作り方 / Build |
+### インストーラー
+| OS | 形式 | 作り方 |
 |---|---|---|
-| Windows x64 / ARM64 | `COBOL_to-Setup-x64.exe` / `-arm64.exe` (Inno Setup。ユーザー単位、PATH追加は任意) | `installer/cobol_to.iss` |
+| Windows x64 / ARM64 | `COBOL_to-Setup-x64.exe` / `-arm64.exe`(Inno Setup、ユーザー単位、PATH 追加は任意) | `installer/cobol_to.iss` |
 | Linux amd64 / arm64 | `cobol-to_<版>_<arch>.deb`、`.tar.gz` | `installer/build-deb.sh` |
 | macOS arm64 / x64 | `COBOL_to-<版>-macos-<arch>.pkg`(未署名) | `installer/build-pkg.sh` |
 
-タグ `v*` の push で `.github/workflows/release.yml` が全OS分を作り、各OSで install→実行→uninstall の通し試験をしてから Release に添付します。
-Tagging `v*` builds every installer, smoke-tests install → run → uninstall on each OS, then attaches them to the Release.
+タグ `v*` の push で `.github/workflows/release.yml` が全 OS 分を作り、各 OS で install→実行→uninstall の通し試験をしてから Release に添付します。
+検証状況: Windows x64 と Linux amd64(WSL)は手元で確認済み。Windows ARM64・Linux arm64・macOS は CI の結果次第(macOS の署名・公証は未対応)。
 
-検証状況 / Status: Windows x64(install/実行/uninstall)と Linux amd64(WSLで dpkg -i/実行/-r)は手元で確認済み。Windows ARM64・Linux arm64・macOS は CI 初回実行まで未確認、macOS の署名・公証は未対応(Apple のシークレットが必要)。
+### 更新通知
+自動更新しきれないものは、登録した 2 つのメールへ Claude 向けメッセージとして送ります → [NOTIFY.md](NOTIFY.md)(日英独露)。
+
+## English
+
+### What it does
+- **Auto-detection**: IBM Enterprise (mainframe) / Micro Focus / GnuCOBOL / ACUCOBOL-GT / Fujitsu NetCOBOL / Hitachi COBOL; standards COBOL-68, 74, 85, 2002/2014; fixed or free format. Evidence goes to `COBOL_to-REPORT.md`.
+- **Choose the target** (4 stacks): (1) latest Python + latest FastAPI + Next.js/Node.js + HTML5/CSS3/TypeScript/Bootstrap; (2) latest Python + latest MFastAPI + the same; (3) latest Rust + latest Poem; (4) latest Rust + latest RPoem (no Bootstrap, TypeScript, Next.js or Node.js; RPoem is Rust→WASM).
+- **Folder picker**: started without arguments, a native file dialog opens so you can pick the top folder of a program or a multi-project tree. For the output you can pick an existing folder or type a new name (empty = `<source>-converted`).
+- **API**: Connect style `POST /cobol_to.Program/Run` (no REST).
+
+### Usage
+```
+cobol_to                                  # opens the folder picker
+cobol_to --src <dir> --target <fastapi|mfastapi|rust-poem|rpoem> --out <dir>
+```
+
+### Current limits (honest status)
+- Only `PROGRAM-ID`, `01/77` (PIC, VALUE), `DISPLAY`, `MOVE`, `ADD`, `STOP RUN` are converted. `IF`, `PERFORM`, `COMPUTE`, file I/O, `COPY` etc. are **not dropped silently**; they appear as `TODO(COBOL_to)`.
+- EBCDIC mainframe files are not converted, only listed in the report (convert to UTF-8/ASCII first).
+- Output is a program registry plus a skeleton; wiring into a real FastAPI/MFastAPI/RPoem server and generating the Next.js UI are not implemented.
+- Dependencies of generated projects are **not pinned** (latest versions follow version-control notifications).
+
+### Installers
+See the table above. Tagging `v*` builds every installer in `.github/workflows/release.yml`, smoke-tests install → run → uninstall on each OS, then attaches them to the Release. Verified locally: Windows x64 and Linux amd64 (WSL); the rest depends on CI (macOS signing/notarization not done).
+
+### Update notifications
+What cannot be updated automatically is mailed to two registered addresses as a Claude message → [NOTIFY.md](NOTIFY.md) (JA/EN/DE/RU).
