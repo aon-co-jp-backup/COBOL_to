@@ -40,7 +40,7 @@ cobol_to --src <dir> --target <fastapi|mfastapi|rust-poem|rpoem> --out <dir>
 | macOS arm64 / x64 | `COBOL_to-<版>-macos-<arch>.pkg`(未署名) | `installer/build-pkg.sh` |
 
 タグ `v*` の push で `.github/workflows/release.yml` が全 OS 分を作り、各 OS で install→実行→uninstall の通し試験をしてから Release に添付します。
-検証状況: Windows x64 と Linux amd64(WSL)は手元で確認済み。Windows ARM64・Linux arm64・macOS は CI の結果次第(macOS の署名・公証は未対応)。
+検証状況: Windows x64 と Linux amd64(WSL)は手元で確認済み。Windows ARM64 は v0.1.0 の CI で成功。Linux と macOS は v0.1.0 で失敗(CI の依存不足・廃止 runner)→ 修正して `v0.1.1` の CI を実行中(macOS の署名・公証は未対応)。
 
 ### 更新通知
 自動更新しきれないものは、登録した 2 つのメールへ Claude 向けメッセージとして送ります → [NOTIFY.md](NOTIFY.md)(日英独露)。
@@ -66,7 +66,7 @@ cobol_to --src <dir> --target <fastapi|mfastapi|rust-poem|rpoem> --out <dir>
 - Dependencies of generated projects are **not pinned** (latest versions follow version-control notifications).
 
 ### Installers
-See the table above. Tagging `v*` builds every installer in `.github/workflows/release.yml`, smoke-tests install → run → uninstall on each OS, then attaches them to the Release. Verified locally: Windows x64 and Linux amd64 (WSL); the rest depends on CI (macOS signing/notarization not done).
+See the table above. Tagging `v*` builds every installer in `.github/workflows/release.yml`, smoke-tests install → run → uninstall on each OS, then attaches them to the Release. Verified locally: Windows x64 and Linux amd64 (WSL). Windows ARM64 passed in the v0.1.0 CI; Linux and macOS failed in v0.1.0 (missing CI dependencies, retired runner) and are fixed, with the `v0.1.1` CI now running (macOS signing/notarization not done).
 
 ### Update notifications
 What cannot be updated automatically is mailed to two registered addresses as a Claude message → [NOTIFY.md](NOTIFY.md) (JA/EN/DE/RU).

@@ -32,8 +32,9 @@ COBOL(各方言・各版・固定/自由形式)を自動判定し、Python(FastA
 
 ### 状態(2026-11-18)
 - 手元で確認済み: テスト成功、Windows x64 のインストール/実行/アンインストール、Linux amd64 の `dpkg -i`/実行/`-r`(WSL)。
-- `v0.1.0` タグを push 済みで、リリース CI を実行中(結果は GitHub Actions の `release`)。Windows ARM64・Linux arm64・macOS は CI が初めての確認。
-- version-control は `root = "F:/"` なので `F:\COBOL_to` を自動で走査する(動作確認は走査が長く未了)。通知メールは `email_to` の 2 件(手元と VPS の両方の `config.toml`)。VPS で `version-control.service` を実行して `e-mail: sent` を確認、受信箱への到達は未確認、LINE は未設定。
+- **v0.1.0 は失敗(Release 無し・タグだけ残る)**: Linux は CI に wayland 開発ライブラリが無くビルド失敗(実行時も `libwayland-client.so.0` に依存)、macOS x64 の runner `macos-13` は廃止で待機のまま。Windows x64/ARM64 は成功。修正(b2180c8・da0cf50)して **`v0.1.1` を push、リリース CI(run 44166948447)を実行中**。Linux arm64・macOS は v0.1.1 が初めての確認。タグは付け直さず次は `v0.1.2` で出す。
+- 教訓: 手元(WSL)に開発ライブラリが入っていると CI の欠落に気づけない。`ldd` で実行時依存を調べて `.deb` の `Depends` に入れる。
+- version-control は `root = "F:/"` なので `F:\COBOL_to` を自動で走査する(動作確認は走査が長く未了)。通知メールは `email_to` の 2 件(手元と VPS の両方の `config.toml`)。VPS で `version-control.service` を実行して `e-mail: sent` を確認、受信箱への到達は未確認、LINE は未設定。**2 件とも届いていない(利用者報告)**: SMTP は 3 回とも受理(`SMTP send failed` 0 件)でコードのバグではない。送信元は `smtp.lolipop.jp` 経由の `aon.co.jp` だが、`aon.co.jp` には **TXT(SPF)も `_dmarc` も無い**(DNS は value-domain)ため、Gmail に迷惑メール扱い/破棄されている疑い。迷惑メール欄・送信元受信箱の返送を確認し、SPF(Lolipop 指定値を確認)・DMARC を追加する(DNS は利用者の操作)。
 
 ## English
 
@@ -65,5 +66,6 @@ A tool that auto-detects COBOL (dialects, standards, fixed/free format) and conv
 
 ### Status (2026-11-18)
 - Verified locally: tests pass, Windows x64 install/run/uninstall, Linux amd64 `dpkg -i`/run/`-r` (WSL).
-- Tag `v0.1.0` is pushed and the release CI is running (result: GitHub Actions `release`). Windows ARM64, Linux arm64 and macOS are first verified by CI.
-- version-control uses `root = "F:/"`, so `F:\COBOL_to` is scanned automatically (a live check was not finished; the scan is long). Notification mail goes to the two `email_to` addresses (both the local and the VPS `config.toml`). Running `version-control.service` on the VPS logged `e-mail: sent`; delivery to the inboxes is unconfirmed; LINE is not configured.
+- **v0.1.0 failed (no Release; only the tag remains)**: Linux failed to build because CI lacked the wayland dev libraries (the binary also needs `libwayland-client.so.0` at run time), and the macOS x64 runner `macos-13` is retired and stayed queued. Windows x64/ARM64 passed. Fixed (b2180c8, da0cf50), **`v0.1.1` is pushed and its release CI (run 44166948447) is running**. Linux arm64 and macOS are first verified by v0.1.1. Do not move tags; ship the next fix as `v0.1.2`.
+- Lesson: dev libraries present locally (WSL) hide gaps in CI. Check run-time deps with `ldd` and list them in the `.deb` `Depends`.
+- version-control uses `root = "F:/"`, so `F:\COBOL_to` is scanned automatically (a live check was not finished; the scan is long). Notification mail goes to the two `email_to` addresses (both the local and the VPS `config.toml`). Running `version-control.service` on the VPS logged `e-mail: sent`; delivery to the inboxes is unconfirmed; LINE is not configured. **The user reports neither mail arrived**: SMTP accepted all three sends (0 `SMTP send failed`), so it is not a code bug. The sender is `aon.co.jp` via `smtp.lolipop.jp`, but `aon.co.jp` has **no TXT (SPF) record and no `_dmarc`** (DNS at value-domain), so Gmail probably files it as spam or drops it. Check the spam folder and bounces in the sender mailbox, then add SPF (confirm Lolipop's value) and DMARC (DNS is the user's action).
