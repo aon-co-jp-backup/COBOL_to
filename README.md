@@ -40,7 +40,7 @@ cobol_to --src <dir> --target <fastapi|mfastapi|rust-poem|rpoem> --out <dir>
 | macOS arm64 / x64 | `COBOL_to-<版>-macos-<arch>.pkg`(未署名) | `installer/build-pkg.sh` |
 
 タグ `v*` の push で `.github/workflows/release.yml` が全 OS 分を作り、各 OS で install→実行→uninstall の通し試験をしてから Release に添付します。
-検証状況: Windows x64 と Linux amd64(WSL)は手元で確認済み。Windows ARM64 は v0.1.0 の CI で成功。Linux と macOS は v0.1.0 で失敗(CI の依存不足・廃止 runner)→ 修正して `v0.1.1` の CI を実行中(macOS の署名・公証は未対応)。
+検証状況: **v0.1.2 の CI で全6ジョブ成功**(Windows x64/ARM64・Linux amd64/arm64・macOS arm64/x64 で install→実行→uninstall の通し試験を通過)し、[Release v0.1.2](https://github.com/aon-co-jp/COBOL_to/releases/tag/v0.1.2) に 8 個のインストーラーと `SHA256SUMS.txt` を添付。実機での確認は Windows x64 と Linux amd64(WSL)のみで、他は CI のランナー上。macOS の署名・公証は未対応(未署名の .pkg は警告が出る)。
 
 ### 更新通知
 自動更新しきれないものは、登録した 2 つのメールへ Claude 向けメッセージとして送ります → [NOTIFY.md](NOTIFY.md)(日英独露)。
@@ -66,7 +66,7 @@ cobol_to --src <dir> --target <fastapi|mfastapi|rust-poem|rpoem> --out <dir>
 - Dependencies of generated projects are **not pinned** (latest versions follow version-control notifications).
 
 ### Installers
-See the table above. Tagging `v*` builds every installer in `.github/workflows/release.yml`, smoke-tests install → run → uninstall on each OS, then attaches them to the Release. Verified locally: Windows x64 and Linux amd64 (WSL). Windows ARM64 passed in the v0.1.0 CI; Linux and macOS failed in v0.1.0 (missing CI dependencies, retired runner) and are fixed, with the `v0.1.1` CI now running (macOS signing/notarization not done).
+See the table above. Tagging `v*` builds every installer in `.github/workflows/release.yml`, smoke-tests install → run → uninstall on each OS, then attaches them to the Release. Status: **all 6 jobs of the v0.1.2 CI passed** (install → run → uninstall on Windows x64/ARM64, Linux amd64/arm64, macOS arm64/x64) and [Release v0.1.2](https://github.com/aon-co-jp/COBOL_to/releases/tag/v0.1.2) carries 8 installers plus `SHA256SUMS.txt`. Real-machine checks exist only for Windows x64 and Linux amd64 (WSL); the rest ran on CI runners. macOS signing/notarization is not done (the unsigned .pkg shows a warning).
 
 ### Update notifications
 What cannot be updated automatically is mailed to two registered addresses as a Claude message → [NOTIFY.md](NOTIFY.md) (JA/EN/DE/RU).
