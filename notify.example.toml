@@ -1,0 +1,5 @@
+# version-control/config.toml の [notify] に、次の 2 件を自分のアドレスで登録する。
+# Register two addresses of your own under [notify] in version-control/config.toml.
+# Zwei eigene Adressen unter [notify] eintragen. / Укажите два своих адреса в [notify].
+[notify]
+email_to = ["address-1@example.com", "address-2@example.com"]
