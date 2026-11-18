@@ -13,6 +13,7 @@ pub enum Expr {
     Str(String),
     Var(String),
     Idx(String, Box<Expr>),          // 添字つき(1 始まり)
+    Slice(String, Box<Expr>, Option<Box<Expr>>), // 参照修飾 X(start:len)
     Func(String, Vec<Expr>),         // FUNCTION NAME(args)
     Bin(char, Box<Expr>, Box<Expr>), // + - * / ^
     Neg(Box<Expr>),
@@ -302,9 +303,6 @@ impl P {
         if c == '"' || c == '\'' {
             return Ok(Expr::Str(s[1..s.len().saturating_sub(1)].to_string()));
         }
-        if s.contains(':') {
-            return Err("参照修飾(X(a:b))は未対応".into());
-        }
         if c.is_ascii_digit() || (c == '-' && s.len() > 1) {
             return Ok(Expr::Num(s));
         }
@@ -334,6 +332,33 @@ impl P {
         self.used.insert(n.clone());
         if self.peek().map(|x| x.s == "(").unwrap_or(false) {
             self.next();
+            let mut j = self.i;
+            let mut joined = String::new();
+            while let Some(t) = self.t.get(j) {
+                if t.s == ")" {
+                    break;
+                }
+                joined.push_str(&t.s);
+                j += 1;
+            }
+            if joined.contains(':') && self.t.get(j).is_some() {
+                let (a, b) = joined.split_once(':').unwrap();
+                let mk = |x: &str, me: &mut P| -> Result<Expr, String> {
+                    if x.chars().all(|c| c.is_ascii_digit()) {
+                        Ok(Expr::Num(x.to_string()))
+                    } else if x.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+                        let v = ident(x);
+                        me.used.insert(v.clone());
+                        Ok(Expr::Var(v))
+                    } else {
+                        Err("参照修飾の位置・長さは数か変数のみ対応".into())
+                    }
+                };
+                let start = mk(a, self)?;
+                let len = if b.is_empty() { None } else { Some(Box::new(mk(b, self)?)) };
+                self.i = j + 1;
+                return Ok(Expr::Slice(n, Box::new(start), len));
+            }
             let idx = self.expr(1)?;
             if !self.peek().map(|x| x.s == ")").unwrap_or(false) {
                 return Err("多次元の添字は未対応".into());
@@ -1857,6 +1882,7 @@ fn is_numeric(p: &Program, e: &Expr) -> bool {
     match e {
         Expr::Num(_) | Expr::Neg(_) | Expr::Bin(..) => true,
         Expr::Str(_) => false,
+        Expr::Slice(..) => false,
         Expr::Var(v) | Expr::Idx(v, _) => {
             let (b, _, _) = split_lv(v);
             var_of(p, &b).map(|x| x.numeric).unwrap_or(true)
@@ -1925,6 +1951,21 @@ fn sx(p: &Program, e: &Expr, l: Lang) -> (String, u32) {
                     Lang::Rs => format!("self.{c}[(({ic}) - 1) as usize]"),
                 },
                 scale_of(p, &b),
+            )
+        }
+        Expr::Slice(v, a, len) => {
+            let (b, _, _) = split_lv(v);
+            let c = canon(p, &b);
+            let (sa, _) = sx(p, a, l);
+            let ln = len.as_ref().map(|x| sx(p, x, l).0);
+            (
+                match (l, ln) {
+                    (Lang::Py, Some(n)) => format!("str(self.{c})[({sa}) - 1:({sa}) - 1 + ({n})]"),
+                    (Lang::Py, None) => format!("str(self.{c})[({sa}) - 1:]"),
+                    (Lang::Rs, Some(n)) => format!("format!(\"{{}}\", self.{c}).chars().skip((({sa}) - 1) as usize).take(({n}) as usize).collect::<String>()"),
+                    (Lang::Rs, None) => format!("format!(\"{{}}\", self.{c}).chars().skip((({sa}) - 1) as usize).collect::<String>()"),
+                },
+                0,
             )
         }
         Expr::Neg(x) => {
@@ -2681,6 +2722,15 @@ mod tests {
         assert!(out.contains("01 PRICE PIC 9(3) VALUE 7."), "{out}");
         assert_eq!(parse(&out, false).vars.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn reference_modification_reads() {
+        let src = "       PROGRAM-ID. R.\n       DATA DIVISION.\n       WORKING-STORAGE SECTION.\n       01 S PIC X(10) VALUE \"ABCDEFGH\".\n       01 K PIC 9 VALUE 3.\n       PROCEDURE DIVISION.\n           DISPLAY S(2:3) \"-\" S(K:2) \"-\" S(5:).\n           STOP RUN.\n";
+        let p = parse(src, false);
+        let py = to_python(&p);
+        assert!(!py.contains("未対応の文"), "{py}");
+        assert!(py.contains("str(self.s)[(2) - 1:(2) - 1 + (3)]"), "{py}");
+        assert!(to_rust(&p).contains(".skip(((5) - 1) as usize).collect::<String>()"));
     }
     #[test]
     fn unsupported_stays_visible() {
