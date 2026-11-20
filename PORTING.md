@@ -1,0 +1,97 @@
+# COBOL_to — お引越し・再開 / Porting and resume
+
+**日本語 → English**
+
+## 日本語
+
+### 別の PC・別アカウントで再開する手順
+1. `git clone https://github.com/aon-co-jp/COBOL_to` して `cd COBOL_to`。
+2. Rust(最新の stable)を入れる。`cargo build --release` と `cargo test`。
+3. Windows のインストーラーを作るなら Inno Setup 6 を入れ、`ISCC /DAppVersion=0.1.0 /DArch=x64 /DExeDir=..\target\release installer\cobol_to.iss`(出力は `dist\`)。Linux の `.deb` は `installer/build-deb.sh`、macOS の `.pkg` は macOS 上で `installer/build-pkg.sh`。
+4. 動作確認: `cobol_to --src tests/samples --target rust-poem --out <出力先>`。`src/programs/hello.rs` ができ、`COBOL_to-REPORT.md` に判定が出る。
+5. 更新通知は version-control の `config.toml`(git 管理外)の `[notify] email_to` に自分のメールを 2 件書く。`root` も自分のドライブ/フォルダにする。秘密(トークン等)はリポジトリに入れない。
+
+### 未了(優先順)
+1. **(完了)リリース CI**: `v0.1.2`(run 44168310290)が全6ジョブ成功、Release に deb×2・tar.gz×2・pkg×2・exe×2・`SHA256SUMS.txt`。残るのは実機での確認(Linux arm64・macOS・Windows ARM64)と macOS の署名。以下は経緯(旧記述)。**(旧)**タグ `v0.1.1`、run 44166948447。v0.1.0 は Linux のビルド失敗と macOS x64 の廃止 runner で Release 無し(Windows は成功)。v0.1.1 で Linux arm64・macOS の通し試験が初確認。失敗があればタグを付け直さず `v0.1.2` で出す。成功したら Release の添付物と SHA256SUMS を確認し、README の検証状況を更新。
+2. **変換できる構文の拡充**: `IF`/`EVALUATE`/`PERFORM`(`UNTIL`・`VARYING`)/`COMPUTE`/`SUBTRACT`/`MULTIPLY`/`DIVIDE`/`STRING`/`INSPECT`/`COPY`・`REPLACING`/ファイル I/O/`CALL`/`EXEC SQL`・`EXEC CICS`、数値の小数・符号・`COMP-3`、CONTINUATION 行。テストは `tests/samples` に実プログラムを足して追加。
+3. **生成物の実サーバー接続**: FastAPI/MFastAPI/Poem/RPoem に `POST /cobol_to.Program/Run`(Connect)を実装。Next.js(TypeScript+Bootstrap)の画面の自動生成。RPoem は Rust→WASM の画面。
+4. **最新版への自動追従**: 生成物の依存は固定していない。`cargo add` と PyPI/npm の最新取得、version-control の登録。
+5. **通知メールが届かない件**: VPS では `e-mail: sent`(SMTP は受理、コードのバグではない)だが、`norukia.jp@gmail.com` と `cloud9slack@gmail.com` には**届いていない**(利用者報告)。`aon.co.jp` に SPF(TXT)も `_dmarc` も無いのが有力な原因。迷惑メール欄と送信元(`inf…@aon.co.jp`)の返送を確認 → value-domain で SPF(Lolipop 指定値を確認)・DMARC を追加(利用者の操作)。直らない場合は別の送信経路を検討。LINE は未設定。
+6. **GitHub の owner 配下を起点にした走査**: version-control には未実装(`root` のみ)。
+7. **macOS の署名・公証**(Apple のシークレットが必要)、EBCDIC の自動変換、Linux の `.rpm`/AppImage。
+8. **version-control による COBOL_to の実走査確認**(`root = "F:/"` で拾われるはず。走査が長いので `--dry-run --no-fetch --no-api` を時間に余裕のあるときに)。
+
+### 注意
+- この PC の Bash に `cargo` は無い(PowerShell で PATH を前置き)。`cargo test` は debug の exe を更新しない。
+- 履歴は新規。旧名(`COBOL2`/`COBOL-to`)のリポジトリは作っていない。
+
+### 再開用メッセージ(そのまま貼り付け)
+> `F:\COBOL_to`(GitHub: aon-co-jp/COBOL_to)を再開してください。まず `README.md`・`CLAUDE.md`・`PORTING.md` を読むこと。COBOL の方言・版・書式を自動判定し、FastAPI / MFastAPI / Rust+Poem / Rust+RPoem(RPoem は Bootstrap・TypeScript・Next.js・Node.js なし)へ変換するツールで、API は REST ではなく Connect(`POST /cobol_to.Program/Run`)。v0.1.2 の Release は公開済みで CI は全6ジョブ成功しています(v0.1.0/v0.1.1 は失敗のため Release 無し。タグは動かさない)。次に直す点があれば v0.1.3 以降で出してください。通知メールが利用者に届いていない件(`aon.co.jp` に SPF/DMARC が無い疑い)も `PORTING.md` の 5 を見て進めてください。次に、`PORTING.md` の未了の優先順(構文の拡充 → 実サーバー接続 → 最新版への自動追従)を進めてください。注意: Bash に cargo は無いので PowerShell で PATH を前置きする、`cargo test` は debug の exe を更新しない、未対応の構文は黙って落とさず `TODO(COBOL_to)` にする、メールアドレスやトークンはリポジトリに入れない、`git pull` 前に `git status -sb` で分岐を確認する。
+
+## English
+
+### Resume on another PC or account
+1. `git clone https://github.com/aon-co-jp/COBOL_to` and `cd COBOL_to`.
+2. Install the latest stable Rust. `cargo build --release` and `cargo test`.
+3. For the Windows installer install Inno Setup 6 and run `ISCC /DAppVersion=0.1.0 /DArch=x64 /DExeDir=..\target\release installer\cobol_to.iss` (output in `dist\`). The Linux `.deb` is `installer/build-deb.sh`; the macOS `.pkg` is `installer/build-pkg.sh` on macOS.
+4. Check: `cobol_to --src tests/samples --target rust-poem --out <out>` creates `src/programs/hello.rs` and the detection in `COBOL_to-REPORT.md`.
+5. For update notifications put your own two addresses into `[notify] email_to` in version-control's `config.toml` (git-ignored) and set `root` to your drive/folder. Never commit secrets.
+
+### Open items (priority order)
+1. **(Done) Release CI**: `v0.1.2` (run 44168310290) passed all 6 jobs; the Release holds 2 debs, 2 tar.gz, 2 pkg, 2 exe and `SHA256SUMS.txt`. Still open: real-machine checks (Linux arm64, macOS, Windows ARM64) and macOS signing. The rest is history (old text). **(Old)** tag `v0.1.1`, run 44166948447. v0.1.0 had no Release: Linux failed to build and the macOS x64 runner was retired (Windows passed). v0.1.1 is the first real check of the Linux arm64 and macOS smoke tests. On failure ship `v0.1.2` rather than moving the tag. On success verify the Release assets and `SHA256SUMS`, then update the README status.
+2. **Widen the supported syntax**: `IF`/`EVALUATE`/`PERFORM` (`UNTIL`, `VARYING`)/`COMPUTE`/`SUBTRACT`/`MULTIPLY`/`DIVIDE`/`STRING`/`INSPECT`/`COPY`+`REPLACING`/file I/O/`CALL`/`EXEC SQL`+`EXEC CICS`, decimals/signs/`COMP-3`, continuation lines. Add real programs to `tests/samples` as tests.
+3. **Wire the output into real servers**: implement `POST /cobol_to.Program/Run` (Connect) in FastAPI/MFastAPI/Poem/RPoem; generate the Next.js (TypeScript + Bootstrap) UI; a Rust→WASM UI for RPoem.
+4. **Automatic latest versions**: generated dependencies are not pinned. Use `cargo add` and the PyPI/npm latest lookups; register in version-control.
+5. **Notification mail is not arriving**: the VPS logs `e-mail: sent` (SMTP accepted; not a code bug), yet the user reports nothing reached `norukia.jp@gmail.com` or `cloud9slack@gmail.com`. The likely cause is that `aon.co.jp` has no SPF (TXT) record and no `_dmarc`. Check the spam folder and bounces in the sender mailbox (`inf…@aon.co.jp`), then add SPF (confirm Lolipop's value) and DMARC at value-domain (the user's action). If that does not help, consider another sending path. LINE is not configured.
+6. **Scanning from a GitHub owner**: not implemented in version-control (only `root`).
+7. **macOS signing/notarization** (Apple secrets needed), EBCDIC auto-conversion, Linux `.rpm`/AppImage.
+8. **Live version-control scan of COBOL_to** (should be picked up via `root = "F:/"`; the scan is long, so run `--dry-run --no-fetch --no-api` when there is time).
+
+### Notes
+- No `cargo` in this PC's Bash (prepend PATH in PowerShell). `cargo test` does not refresh the debug exe.
+- History is fresh. No repositories were created under the old names (`COBOL2`/`COBOL-to`).
+
+### Resume message (paste as is)
+> Please resume `F:\COBOL_to` (GitHub: aon-co-jp/COBOL_to). Read `README.md`, `CLAUDE.md` and `PORTING.md` first. It auto-detects the COBOL dialect, standard and source format and converts to FastAPI / MFastAPI / Rust+Poem / Rust+RPoem (RPoem without Bootstrap, TypeScript, Next.js or Node.js); the API is Connect (`POST /cobol_to.Program/Run`), not REST. The Release v0.1.2 is published and all 6 CI jobs passed (v0.1.0/v0.1.1 failed and have no Release; never move a tag). Ship any further fix as v0.1.3 or later. Also work on the notification mail not reaching the user (suspected missing SPF/DMARC for `aon.co.jp`), see item 5 in `PORTING.md`. Then work through the open items in `PORTING.md` in order (syntax coverage → real server wiring → automatic latest versions). Cautions: Bash has no cargo, so prepend PATH in PowerShell; `cargo test` does not refresh the debug exe; never drop unsupported syntax silently, emit `TODO(COBOL_to)`; keep e-mail addresses and tokens out of the repository; check `git status -sb` for divergence before any `git pull`.
+
+## 2026-11-18 追記2: 未対応の構文を一括対応 / Remaining syntax implemented
+**日本語**: 未了の2(構文の拡充)の大半を実装した。`GO TO`(DEPENDING ON・段落の状態機械)・`PERFORM THRU`・小数(固定小数点・ROUNDED)・`OCCURS`(添字)・`REDEFINES`(同型は別名、他は別領域+注記)・`88` 条件名・`NUMERIC`/`ALPHABETIC`・`STRING`/`UNSTRING`/`INSPECT`・`INITIALIZE`/`SET`/`ACCEPT`・`DIVIDE REMAINDER`・`FUNCTION`(9種)・継続行・`COPY`(変換前に展開)・`CALL`(`EXTERNAL`/`run_with` に登録する外部呼び出し)・順編成ファイル I/O(SELECT/FD/OPEN/READ/WRITE/CLOSE/FILE STATUS)。`tests/samples/features.cbl`・`fileio.cbl`・`misc.cbl` を Python と Rust の両方で実行し同一出力を確認、`cargo test` 9件成功。**未対応(TODO表示)**: SORT/MERGE/SEARCH、EXEC SQL/CICS、索引・相対ファイル・REWRITE、COMP-3 の表現、参照修飾、多次元添字、STRING POINTER/ON OVERFLOW、ON SIZE ERROR、BEFORE/AFTER、動的 CALL、ACCEPT FROM DATE、メモリ重ね合わせ。**未確認**: 実際のメインフレーム由来の大きなプログラムでの通し(サンプルは自作の小さなもの)、CI(Linux arm64・macOS)上での新サンプル変換。次は v0.1.3 として出すか、上記の TODO を順に。
+**English**: Most of open item 2 (syntax coverage) is implemented: `GO TO` (incl. `DEPENDING ON`; paragraphs run on a small state machine), `PERFORM THRU`, decimals (fixed point, `ROUNDED`), `OCCURS` subscripts, `REDEFINES` (aliased when types match, otherwise a separate area plus a note), level-88 condition names, `NUMERIC`/`ALPHABETIC`, `STRING`/`UNSTRING`/`INSPECT`, `INITIALIZE`/`SET`/`ACCEPT`, `DIVIDE REMAINDER`, nine `FUNCTION`s, continuation lines, `COPY` (expanded before parsing), `CALL` (external calls registered in `EXTERNAL` / `run_with`), and sequential file I/O. `tests/samples/features.cbl`, `fileio.cbl`, `misc.cbl` give identical output in generated Python and Rust; 9 unit tests pass. **Not supported (shown as TODO)**: SORT/MERGE/SEARCH, EXEC SQL/CICS, indexed/relative files and REWRITE, COMP-3 representation, reference modification, multi-dimensional subscripts, STRING POINTER / ON OVERFLOW, ON SIZE ERROR, BEFORE/AFTER, dynamic CALL, ACCEPT FROM DATE, true memory overlay. **Unverified**: large real-world mainframe programs (samples are small and hand-written) and converting the new samples on CI (Linux arm64, macOS). Next: ship as v0.1.3, or work through the TODO list above.
+
+## 2026-11-18 追記: 変換を「小さく→多機能」へ / Conversion grown from minimal to richer
+**日本語**: `src/convert.rs` を構造化(式・条件の構文解析)。対応: IF/ELSE/END-IF(AND/OR/NOT・比較語)、PERFORM(段落・n TIMES・UNTIL・VARYING・インライン)、段落、COMPUTE、ADD/SUBTRACT/MULTIPLY/DIVIDE(GIVING 含む)、STOP RUN/GOBACK。未対応の文(OPEN/READ/WRITE/CALL/EVALUATE/GO TO 等)は `TODO(COBOL_to)` として残す。数値は整数(小数 PICは近似+TODO)。`tests/samples/calc.cbl` を Python と Rust の両方で実行し、同じ出力(`TOTAL=35 MSG=BIG`)を確認。次: EVALUATE・ファイル I/O・小数(固定小数点)・REDEFINES/OCCURS。
+**EVALUATE(WHEN 値・OR・OTHER・TRUE)も対応**。
+**English**: EVALUATE is supported too. `convert.rs` now parses expressions/conditions. Supported: IF/ELSE, PERFORM (paragraph, TIMES, UNTIL, VARYING, inline), paragraphs, COMPUTE, ADD/SUBTRACT/MULTIPLY/DIVIDE (GIVING), STOP RUN/GOBACK. Unsupported statements stay as `TODO(COBOL_to)`. Numbers are integers. `calc.cbl` gives identical output in generated Python and Rust. Next: EVALUATE, file I/O, fixed-point decimals, REDEFINES/OCCURS.
+
+> このリポジトリの変換機能は `pl2pl` に統合され、組み合わせ選択は pl2pl が最優先で進めます。/ The conversion features of this repository are being merged into `pl2pl`, which now carries the selectable-stack feature as top priority. https://github.com/aon-co-jp/pl2pl
+
+## 最優先機能 / Top-priority feature: 組み合わせを選べる変換 (`pl2pl web --backend ...`) (2026-11-19, 10 languages)
+
+```
+pl2pl web <dir> --backend <rust-axum|rust-poem|fastapi|mfastapi|rpoem|rporea>
+                [--frontend bootstrap-ts|rust-wasm|none] [--db none|mysql|mariadb|postgres|sqlite] --out <dir>
+```
+COBOL は変換器で、C / C++ / Fortran は「そのままビルドして呼ぶ橋渡し」(`legacy/build.sh`)で、選んだ組み合わせのアプリの骨組みになります。Axum 版は実際に起動して呼び出しの成功を確認済みです(COBOL と C/C++)。RPoem / RPoRea は Bootstrap・TypeScript なし(Rust→WASM)。
+
+### 日本語
+やさしく言うと、「古いプログラム(COBOL・C・C++・Fortran)を、今のウェブのしくみに乗せる」機能です。サーバーは Axum・Poem・FastAPI・RPoem・RPoRea から、画面は HTML5・CSS3・TypeScript・Bootstrap から、データベースは MySQL・MariaDB・PostgreSQL・SQLite から、好きな組み合わせを選べます。COBOL は書き換えて変換します。C・C++・Fortran は元のまま動かし、ウェブから呼べるようにします(まだ Rust への書き換えはしません)。メインフレーム・UNIX・Linux・Windows・Mac の COBOL を別の OS の COBOL へ直す機能は `pl2pl cobol`(IBM→GnuCOBOL)にあります。
+### English
+In simple words: it puts old programs (COBOL, C, C++, Fortran) onto today's web. You pick the server (Axum, Poem, FastAPI, RPoem or RPoRea), the screen (HTML5, CSS3, TypeScript, Bootstrap) and the database (MySQL, MariaDB, PostgreSQL or SQLite) in any allowed mix. COBOL is rewritten. C, C++ and Fortran keep running as they are, and the web calls them (they are not rewritten into Rust yet). Turning COBOL from one OS into COBOL for another OS is `pl2pl cobol` (IBM to GnuCOBOL).
+### 简体中文
+简单地说:把旧程序(COBOL、C、C++、Fortran)放到今天的网页上。服务器可选 Axum、Poem、FastAPI、RPoem、RPoRea;界面可选 HTML5、CSS3、TypeScript、Bootstrap;数据库可选 MySQL、MariaDB、PostgreSQL、SQLite,自由组合。COBOL 会被改写;C、C++、Fortran 保持原样运行,由网页调用(暂不改写成 Rust)。把 COBOL 从一个系统转到另一个系统用 `pl2pl cobol`。
+### 繁體中文
+簡單地說:把舊程式(COBOL、C、C++、Fortran)放到現在的網頁上。伺服器可選 Axum、Poem、FastAPI、RPoem、RPoRea;畫面可選 HTML5、CSS3、TypeScript、Bootstrap;資料庫可選 MySQL、MariaDB、PostgreSQL、SQLite,自由搭配。COBOL 會被改寫;C、C++、Fortran 維持原樣執行,由網頁呼叫(暫不改寫成 Rust)。把 COBOL 從一個系統轉到另一個系統用 `pl2pl cobol`。
+### 한국어
+쉽게 말하면, 오래된 프로그램(COBOL, C, C++, Fortran)을 지금의 웹에 올려 주는 기능입니다. 서버는 Axum, Poem, FastAPI, RPoem, RPoRea 중에서, 화면은 HTML5, CSS3, TypeScript, Bootstrap 중에서, 데이터베이스는 MySQL, MariaDB, PostgreSQL, SQLite 중에서 마음대로 조합할 수 있습니다. COBOL은 다시 써서 변환하고, C·C++·Fortran은 그대로 실행하면서 웹에서 부릅니다(아직 Rust로 다시 쓰지는 않습니다). COBOL을 다른 OS의 COBOL로 바꾸는 일은 `pl2pl cobol`이 합니다.
+### Deutsch
+Einfach gesagt: Alte Programme (COBOL, C, C++, Fortran) werden ins heutige Web gebracht. Man wählt Server (Axum, Poem, FastAPI, RPoem oder RPoRea), Oberfläche (HTML5, CSS3, TypeScript, Bootstrap) und Datenbank (MySQL, MariaDB, PostgreSQL oder SQLite) frei im erlaubten Rahmen. COBOL wird umgeschrieben; C, C++ und Fortran laufen unverändert und werden vom Web aus aufgerufen (noch nicht nach Rust umgeschrieben). COBOL für ein anderes Betriebssystem erzeugt `pl2pl cobol`.
+### Français
+En termes simples : on met de vieux programmes (COBOL, C, C++, Fortran) sur le web d'aujourd'hui. On choisit le serveur (Axum, Poem, FastAPI, RPoem ou RPoRea), l'écran (HTML5, CSS3, TypeScript, Bootstrap) et la base de données (MySQL, MariaDB, PostgreSQL ou SQLite) dans les combinaisons permises. Le COBOL est réécrit ; C, C++ et Fortran tournent tels quels et sont appelés par le web (pas encore réécrits en Rust). Pour du COBOL d'un autre système, voir `pl2pl cobol`.
+### Español
+En palabras sencillas: lleva programas antiguos (COBOL, C, C++, Fortran) a la web de hoy. Eliges el servidor (Axum, Poem, FastAPI, RPoem o RPoRea), la pantalla (HTML5, CSS3, TypeScript, Bootstrap) y la base de datos (MySQL, MariaDB, PostgreSQL o SQLite) con las combinaciones permitidas. El COBOL se reescribe; C, C++ y Fortran siguen funcionando tal cual y la web los llama (todavía no se reescriben en Rust). Para COBOL de otro sistema operativo, usa `pl2pl cobol`.
+### Português
+Em palavras simples: leva programas antigos (COBOL, C, C++, Fortran) para a web de hoje. Você escolhe o servidor (Axum, Poem, FastAPI, RPoem ou RPoRea), a tela (HTML5, CSS3, TypeScript, Bootstrap) e o banco de dados (MySQL, MariaDB, PostgreSQL ou SQLite) nas combinações permitidas. O COBOL é reescrito; C, C++ e Fortran continuam rodando como estão e a web os chama (ainda não são reescritos em Rust). Para COBOL de outro sistema, use `pl2pl cobol`.
+### Русский
+Простыми словами: старые программы (COBOL, C, C++, Fortran) переносятся в сегодняшний веб. Сервер выбирается из Axum, Poem, FastAPI, RPoem, RPoRea; интерфейс — из HTML5, CSS3, TypeScript, Bootstrap; база данных — из MySQL, MariaDB, PostgreSQL, SQLite, в допустимых сочетаниях. COBOL переписывается; C, C++ и Fortran работают как есть, а веб их вызывает (в Rust пока не переписываются). COBOL для другой ОС делает `pl2pl cobol`.
+
+**確認したこと / Verified**: Axum(COBOL 7本・C・C++)を起動して `POST /cobol_to.Program/Run` が正しい出力を返す。全組み合わせの検査は単体試験。**まだ / Not yet**: gfortran の実機ビルド(この PC の WSL に無い)、C/C++/Fortran→Rust の書き換え、COBOL→別 OS の COBOL の拡張、Axum 以外の起動確認。**進め方 / How we work**: 未了は確認せず自動で進める(元のリポジトリの削除だけは最後に確認)。 / Unfinished items go on automatically without asking (only deleting the original repos is confirmed first).
